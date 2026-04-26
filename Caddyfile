@@ -1,0 +1,35 @@
+# SalesSphere ERP — Caddy config.
+#
+# Caddy auto-provisions a Let's Encrypt cert on first request to the
+# domain below. Make sure:
+#   1. The domain's A record points at the droplet's public IP BEFORE
+#      starting Caddy — otherwise the ACME challenge fails.
+#   2. Ports 80 and 443 are open in the DO firewall (they're open by
+#      default on a fresh droplet).
+#
+# Edit `api.salessphere.com` to your real production hostname before
+# `docker compose up`.
+
+api.salessphere.com {
+    # Forward to the `app` service on the internal docker network.
+    reverse_proxy app:3000
+
+    # Compression — saves bandwidth, costs almost no CPU.
+    encode zstd gzip
+
+    # Hardening headers. HSTS only after you're sure prod is HTTPS-only;
+    # a misconfigured HSTS header pins browsers to HTTPS for a year.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Caddy adds Server: Caddy by default — strip it.
+        -Server
+    }
+
+    # JSON access logs to stdout — `docker compose logs caddy` reads them.
+    log {
+        format json
+    }
+}

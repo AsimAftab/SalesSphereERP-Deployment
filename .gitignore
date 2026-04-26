@@ -1,0 +1,11 @@
+# Real production secrets — NEVER commit.
+.env
+.env.local
+.env.production
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.swp

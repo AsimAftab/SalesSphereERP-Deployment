@@ -1,0 +1,85 @@
+# SalesSphere ERP — production stack.
+#
+# This file lives on the droplet and gets pulled by `git pull` during
+# deploys. The actual app code never lands on the droplet — it ships as a
+# pre-built image (built + pushed in the backend repo's CI), which Docker
+# pulls from GHCR.
+#
+# Three services:
+#   - app    backend (Bun + Prisma + Express). Image tag is driven by
+#            $IMAGE_TAG; CI sets it to the deployed commit's SHA.
+#   - redis  BullMQ broker. Internal-only; no host port exposed.
+#   - caddy  reverse proxy + automatic HTTPS via Let's Encrypt. The only
+#            service that listens on the public network.
+#
+# Postgres is NOT here — runs on DigitalOcean Managed Postgres. Keeps
+# storage off the droplet so a droplet rebuild can't lose data.
+
+services:
+  app:
+    image: ghcr.io/asimaftab/salessphere-backend:${IMAGE_TAG:-latest}
+    container_name: salessphere-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      # Override the .env REDIS_URL — inside the docker network the
+      # service hostname is `redis`, not `localhost`.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - internal
+    # Container-level health check is also defined in the Dockerfile;
+    # repeating it here lets `depends_on: condition: service_healthy`
+    # work for any future service that needs the app up first.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--tries=1", "http://localhost:3000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: salessphere-redis
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - redis-data:/data
+    # AOF persistence so BullMQ jobs survive a container restart. Loss
+    # tolerance is "the last second of writes" — fine for a job queue
+    # that already retries on failure.
+    command: ["redis-server", "--appendonly", "yes"]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: salessphere-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # ACME-TLS uses 443 too; no separate port needed.
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - internal
+    depends_on:
+      - app
+
+networks:
+  # Internal-only bridge — Redis + the app talk over it; nothing
+  # outside Docker can reach Redis directly.
+  internal:
+    driver: bridge
+
+volumes:
+  # Named volumes (Docker-managed) so a `docker compose down` doesn't
+  # nuke them; `docker compose down -v` would.
+  redis-data:
+  caddy-data:
+  caddy-config:
