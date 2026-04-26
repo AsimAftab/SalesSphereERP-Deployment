@@ -12,8 +12,8 @@ SalesSphere-ERP/
 └── SalesSphereERP-Deployment/   ← THIS REPO — what runs on the droplet.
     ├── docker-compose.yml       app (from GHCR) + redis + caddy
     ├── Caddyfile                reverse-proxy + auto Let's Encrypt
-    ├── .env.example             production env template (copy → .env on droplet)
-    ├── bootstrap.sh             one-time droplet setup (Docker, firewall, GHCR login)
+    ├── .env.example             production env template (used by install.sh)
+    ├── install.sh               one-command droplet bootstrap (the magic)
     ├── update.sh                manual deploy / rollback (CI uses the same commands)
     └── README.md                you are here
 ```
@@ -39,83 +39,67 @@ The backend repo's CI builds the Docker image and pushes it to `ghcr.io/asimafta
                      daily backups + PITR
 ```
 
-## First-time droplet setup
+## First-time droplet setup — one command
 
-1. **Provision** a fresh Ubuntu 22.04+ droplet on DigitalOcean (1 vCPU / 1 GB RAM is plenty for v1).
+Provision a fresh Ubuntu 22.04+ droplet on DigitalOcean (1 vCPU / 1 GB RAM is plenty for v1), then SSH in as root and run:
 
-2. **Create a non-root deploy user** (SSH as root once):
-   ```bash
-   adduser --disabled-password --gecos "" deploy
-   usermod -aG sudo deploy
-   mkdir -p /home/deploy/.ssh && chmod 700 /home/deploy/.ssh
-   # Paste the public half of the GitHub Actions deploy SSH key:
-   nano /home/deploy/.ssh/authorized_keys
-   chmod 600 /home/deploy/.ssh/authorized_keys
-   chown -R deploy:deploy /home/deploy/.ssh
-   ```
+```bash
+curl -fsSL https://raw.githubusercontent.com/AsimAftab/SalesSphereERP-Deployment/main/install.sh -o install.sh
+bash install.sh
+```
 
-3. **Switch to deploy** + clone this repo:
-   ```bash
-   su - deploy
-   cd ~
-   git clone https://github.com/AsimAftab/SalesSphereERP-Deployment.git
-   cd SalesSphereERP-Deployment
-   ```
+That's it. The script walks through every step interactively in ~1 minute:
 
-4. **Run bootstrap** (installs Docker + Compose + UFW + opens 80/443):
-   ```bash
-   bash bootstrap.sh
-   ```
-   Log out + back in once it finishes (so the `docker` group membership takes effect).
+1. Installs Docker Engine + Compose plugin + UFW + base utilities (openssl, jq, curl, git)
+2. Configures the firewall (allow SSH + HTTP + HTTPS)
+3. Creates the non-root `deploy` user (sudo + docker groups)
+4. Prompts you to paste the GitHub Actions deploy SSH **public** key
+5. Clones this repo into `/home/deploy/SalesSphereERP-Deployment`
+6. Prompts for: production domain, DATABASE_URL, GHCR token, SMTP creds (skippable), super-admin email
+7. **Auto-generates** JWT_SECRET, JWT_REFRESH_SECRET, CSRF_SECRET, SUPERADMIN_PASSWORD (random 48-char base64)
+8. Renders `.env` from the gathered values
+9. Renders `Caddyfile` with your real hostname (substitutes the `api.salessphere.com` placeholder)
+10. Logs in to GHCR + pulls the app image (copies the docker-config.json to the deploy user too)
+11. Pre-checks DNS — warns if your A record doesn't resolve to this droplet's IP yet (Caddy needs that for the TLS handshake)
+12. Applies pending Prisma migrations (one-shot container, same image)
+13. Seeds the platform super-admin (idempotent — safe to re-run)
+14. Brings up `docker compose up -d` + smoke-tests `/health/ready` with retries
+15. Saves a credentials summary to `/home/deploy/credentials-summary.txt` (chmod 600) — has the auto-generated super-admin password, GitHub secrets to add, outstanding manual steps
 
-5. **Fill in production `.env`**:
-   ```bash
-   cp .env.example .env
-   nano .env                       # paste real DATABASE_URL, secrets, SMTP creds
-   chmod 600 .env
-   ```
-   Generate fresh JWT/CSRF secrets — never reuse dev values:
-   ```bash
-   openssl rand -base64 48         # 32+ char string for each
-   ```
+**Idempotent** — safe to re-run if something fails partway. Existing `.env` and `Caddyfile` get backed up to `.bak.<timestamp>` before being overwritten.
 
-6. **Edit `Caddyfile`** to use your real hostname (replace `api.salessphere.com`).
+### Pre-set values via env vars (skip prompts entirely)
 
-7. **Log in to GHCR** so the droplet can pull the image:
-   ```bash
-   # On GitHub: Settings → Developer settings → Personal access tokens
-   # → Tokens (classic) → Generate new token, scope: read:packages
-   echo "ghp_<your-token>" | docker login ghcr.io -u <your-github-username> --password-stdin
-   ```
+For repeatable provisioning across multiple droplets:
 
-8. **Pull the image and start the stack**:
-   ```bash
-   docker compose pull
-   docker compose up -d
-   ```
+```bash
+DOMAIN=api.salessphere.com \
+DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require \
+GHCR_USER=AsimAftab \
+GHCR_TOKEN=ghp_xxxx \
+DEPLOY_SSH_KEY="ssh-ed25519 AAAA... github-deploy" \
+SUPERADMIN_EMAIL=admin@salessphere.com \
+SMTP_HOST=smtp.resend.com \
+SMTP_USER=resend \
+SMTP_PASS=re_xxxx \
+bash install.sh
+```
 
-9. **Apply migrations** (one-shot; safe to re-run):
-   ```bash
-   docker compose run --rm app bunx prisma migrate deploy
-   ```
+Any vars you don't set, the script prompts for. Mixed mode is fine — set what you have, get prompted for the rest.
 
-10. **Seed the platform super-admin** (idempotent):
-    ```bash
-    docker compose run --rm app bun run db:seed
-    ```
+### Outstanding manual steps after the script
 
-11. **Verify**:
-    ```bash
-    docker compose ps                                # all services Up
-    docker compose logs app --tail=50                # boot output
-    curl -fsS http://localhost:3000/health/ready     # {"status":"ok",...}
-    ```
+The script prints these at the end (and saves them in the credentials file) — copy them down:
 
-12. **Point your domain** at the droplet IP. Caddy provisions the TLS cert on the first hit to `https://<your-domain>`.
+1. **Point `<your-domain>`'s A record at the droplet IP.** Caddy provisions the TLS cert on the first request to `https://<your-domain>`. Until DNS resolves, only `http://localhost:3000` from inside the droplet works.
+2. **Add 6 GitHub secrets to the backend repo** (Settings → Secrets and variables → Actions): `DROPLET_HOST`, `DROPLET_USER` (`deploy`), `DROPLET_SSH_KEY` (the **private** half of the deploy SSH key), `DROPLET_SSH_PORT` (only if non-22), `DEPLOYMENT_DIR` (`/home/deploy/SalesSphereERP-Deployment`), `HEALTH_URL` (`https://<your-domain>/health/ready`).
+3. **Create a `production` GitHub Environment** (Settings → Environments → New environment). Empty for v1; add deploy approvals when you have a team.
+4. **Change the super-admin password.** Sign in with the auto-generated one in `credentials-summary.txt`, hit `POST /auth/forgot-password`, redeem the email, set your real password.
+5. **Fill in any blanks in `.env`** you skipped during the prompt (Cloudinary, IRD, etc).
 
 ## Day-to-day
 
-After step 1–12 above, you should never touch the droplet again. The backend repo's CI handles deploys on every push to `main`:
+After the one-command bootstrap above, you should never touch the droplet again. The backend repo's CI handles deploys on every push to `main`:
 
 ```
 main push → CI builds → GHCR pushes sha-<short-sha>
@@ -182,9 +166,14 @@ Migrations don't roll back automatically — write a new compensating migration 
 
 **`Permission denied (publickey)` from CI** — the public half of the GitHub Actions deploy key isn't in `/home/deploy/.ssh/authorized_keys`, or its permissions are wrong (must be `0600`).
 
-**`docker: command not found` after bootstrap** — log out and back in. The `docker` group membership only applies to new shells.
+**`docker: command not found` after install** — log out and back in. The `docker` group membership only applies to new shells. (The script itself runs as root so this only affects you when you SSH in as `deploy` later.)
 
-**`error: failed to solve: ghcr.io/...: failed to fetch`** — the droplet hasn't logged in to GHCR. Re-run the `docker login ghcr.io` step from the bootstrap.
+**`error: failed to solve: ghcr.io/...: failed to fetch`** — the droplet hasn't logged in to GHCR. Re-run `bash install.sh` (the GHCR login phase is idempotent), or manually:
+```bash
+echo $GHCR_TOKEN | docker login ghcr.io -u <user> --password-stdin
+```
+
+**`install.sh` prompts I missed values for** — it's idempotent, just re-run. Existing `.env` will be backed up to `.env.bak.<timestamp>`. Or edit `.env` directly with `nano` and `docker compose up -d` to apply.
 
 **Caddy "no certificates" / 502** — your A record probably doesn't point at the droplet yet, OR the firewall blocks ports 80/443. `sudo ufw status` should show both Allow.
 
