@@ -94,12 +94,18 @@ prompt() {
     # in a terminal show it as the default so the operator can override.
     if [ ! -t 0 ]; then
       note "$desc: ${BOLD}$current${NC} (from env)"
-      return
+      return 0
     fi
     local value
     read -r -p "  $desc [$current]: " value
-    [ -n "$value" ] && printf -v "$var_name" '%s' "$value"
-    return
+    if [ -n "$value" ]; then
+      printf -v "$var_name" '%s' "$value"
+    fi
+    # Explicit `return 0` — bare `return` would propagate the exit status
+    # of the prior `[ -n "$value" ]` test (1 when ENTER was pressed),
+    # which under `set -e` would silently kill the script on every
+    # ENTER-to-keep prompt.
+    return 0
   fi
   local value
   if [ -n "$default" ]; then
@@ -117,15 +123,17 @@ prompt_secret() {
   if [ -n "$current" ]; then
     if [ ! -t 0 ]; then
       note "$desc: ${BOLD}<from env>${NC}"
-      return
+      return 0
     fi
     # Interactive rerun: ENTER keeps the existing value (silent so the
     # secret never echoes). Any other input replaces it.
     local value
     read -r -s -p "  $desc [ENTER to keep current]: " value
     echo
-    [ -n "$value" ] && printf -v "$var_name" '%s' "$value"
-    return
+    if [ -n "$value" ]; then
+      printf -v "$var_name" '%s' "$value"
+    fi
+    return 0
   fi
   local value
   read -r -s -p "  $desc: " value
