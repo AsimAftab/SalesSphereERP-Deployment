@@ -55,8 +55,8 @@ That's it. The script walks through every step interactively in ~1 minute:
 3. Creates the non-root `deploy` user (sudo + docker groups)
 4. Prompts you to paste the GitHub Actions deploy SSH **public** key
 5. Clones this repo into `/home/deploy/SalesSphereERP-Deployment`
-6. Prompts for: production domain, DATABASE_URL, GHCR token, SMTP creds (skippable), super-admin email
-7. **Auto-generates** JWT_SECRET, JWT_REFRESH_SECRET, CSRF_SECRET, SUPERADMIN_PASSWORD (random 48-char base64)
+6. Prompts for: production domain, DATABASE_URL (Neon **or** DigitalOcean Managed Postgres — both speak vanilla Postgres), GHCR token, SMTP creds (skippable), super-admin email
+7. **Auto-generates** JWT_SECRET, JWT_REFRESH_SECRET, CSRF_SECRET, SUPERADMIN_PASSWORD (random 48-char base64). On a rerun these are **preserved** from the existing `.env` so live sessions and the saved credentials summary stay valid.
 8. Renders `.env` from the gathered values
 9. Renders `Caddyfile` with your real hostname (substitutes the `api.salessphere.com` placeholder)
 10. Logs in to GHCR + pulls the app image (copies the docker-config.json to the deploy user too)
@@ -66,7 +66,7 @@ That's it. The script walks through every step interactively in ~1 minute:
 14. Brings up `docker compose up -d` + smoke-tests `/health/ready` with retries
 15. Saves a credentials summary to `/home/deploy/credentials-summary.txt` (chmod 600) — has the auto-generated super-admin password, GitHub secrets to add, outstanding manual steps
 
-**Idempotent** — safe to re-run if something fails partway. Existing `.env` and `Caddyfile` get backed up to `.bak.<timestamp>` before being overwritten.
+**Idempotent** — safe to re-run if something fails partway. On a rerun the script reads the existing `.env`, pre-fills every prompt with its current value (press ENTER to keep, type to override), and reuses the auto-generated secrets so JWT sessions and the saved super-admin password stay valid. The previous `.env` and `Caddyfile` are still backed up to `.bak.<timestamp>` before being rewritten.
 
 ### Pre-set values via env vars (skip prompts entirely)
 
@@ -168,12 +168,12 @@ Migrations don't roll back automatically — write a new compensating migration 
 
 **`docker: command not found` after install** — log out and back in. The `docker` group membership only applies to new shells. (The script itself runs as root so this only affects you when you SSH in as `deploy` later.)
 
-**`error: failed to solve: ghcr.io/...: failed to fetch`** — the droplet hasn't logged in to GHCR. Re-run `bash install.sh` (the GHCR login phase is idempotent), or manually:
+**`error: failed to solve: ghcr.io/...: failed to fetch`** or **`denied: denied`** during install — the GHCR Personal Access Token is missing, expired, or lacks the right scope. The token needs **`read:packages`** (classic tokens) or **Packages: read** (fine-grained tokens) and must belong to a user with read access to the image. Generate one at <https://github.com/settings/tokens>, then re-run `bash install.sh` — your previous answers are pre-filled, you only need to enter the new token. Or log in manually:
 ```bash
 echo $GHCR_TOKEN | docker login ghcr.io -u <user> --password-stdin
 ```
 
-**`install.sh` prompts I missed values for** — it's idempotent, just re-run. Existing `.env` will be backed up to `.env.bak.<timestamp>`. Or edit `.env` directly with `nano` and `docker compose up -d` to apply.
+**`install.sh` prompts I missed values for** — it's idempotent, just re-run. The current values from `.env` are pre-filled into every prompt (press ENTER to keep), and the existing file is backed up to `.env.bak.<timestamp>` before being rewritten. Or edit `.env` directly with `nano` and `docker compose up -d` to apply.
 
 **Caddy "no certificates" / 502** — your A record probably doesn't point at the droplet yet, OR the firewall blocks ports 80/443. `sudo ufw status` should show both Allow.
 

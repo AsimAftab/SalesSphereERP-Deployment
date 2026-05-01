@@ -89,7 +89,16 @@ prompt() {
   local var_name="$1" desc="$2" default="${3:-}"
   local current="${!var_name:-}"
   if [ -n "$current" ]; then
-    note "$desc: ${BOLD}$current${NC} (from env)"
+    # Value already set — from a pre-set env var (CI use) or pre-loaded
+    # from .env on rerun. In a non-interactive shell take it silently;
+    # in a terminal show it as the default so the operator can override.
+    if [ ! -t 0 ]; then
+      note "$desc: ${BOLD}$current${NC} (from env)"
+      return
+    fi
+    local value
+    read -r -p "  $desc [$current]: " value
+    [ -n "$value" ] && printf -v "$var_name" '%s' "$value"
     return
   fi
   local value
@@ -106,7 +115,16 @@ prompt_secret() {
   local var_name="$1" desc="$2"
   local current="${!var_name:-}"
   if [ -n "$current" ]; then
-    note "$desc: ${BOLD}<from env>${NC}"
+    if [ ! -t 0 ]; then
+      note "$desc: ${BOLD}<from env>${NC}"
+      return
+    fi
+    # Interactive rerun: ENTER keeps the existing value (silent so the
+    # secret never echoes). Any other input replaces it.
+    local value
+    read -r -s -p "  $desc [ENTER to keep current]: " value
+    echo
+    [ -n "$value" ] && printf -v "$var_name" '%s' "$value"
     return
   fi
   local value
@@ -127,6 +145,20 @@ gen_secret() { openssl rand -base64 48 | tr -d '\n=' | head -c 48; }
 is_email() { [[ "$1" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; }
 is_url()   { [[ "$1" =~ ^https?:// ]]; }
 is_pgurl() { [[ "$1" =~ ^postgres(ql)?:// ]]; }
+
+# Idempotent re-run support: pre-fill a script variable from an existing
+# .env file. Only sets if currently empty (caller-supplied env vars and
+# values from prior `prompt`s win). Tolerates lines with `=` in the value.
+load_env_var() {
+  # load_env_var ENV_KEY [VAR_NAME=ENV_KEY] [FILE=.env]
+  local key="$1" var="${2:-$1}" file="${3:-.env}"
+  [ -f "$file" ] || return 0
+  [ -z "${!var:-}" ] || return 0
+  local val
+  val=$(grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | sed -E "s/^${key}=//")
+  [ -n "$val" ] || return 0
+  printf -v "$var" '%s' "$val"
+}
 
 # ============================================================
 # Phase 1 — system packages
@@ -221,12 +253,45 @@ else
 fi
 cd "$REPO_DIR"
 
+# Idempotent re-run: pull the previous run's values out of .env so the
+# user can hit Enter through unchanged prompts and the auto-generated
+# JWT/CSRF secrets + super-admin password are preserved (rotating them
+# would invalidate every active session and break the saved credentials
+# summary).
+ENV_PRELOADED=0
+if [ -f .env ]; then
+  ENV_PRELOADED=1
+  # DOMAIN isn't a literal .env key — recover it from APP_URL=https://<host>.
+  if [ -z "${DOMAIN:-}" ]; then
+    DOMAIN=$(grep -E '^APP_URL=' .env 2>/dev/null \
+      | head -n1 | sed -E 's|^APP_URL=https?://||' | cut -d/ -f1)
+  fi
+  load_env_var CORS_ORIGIN
+  load_env_var SUPERADMIN_EMAIL
+  load_env_var DATABASE_URL
+  load_env_var IMAGE_TAG
+  load_env_var SMTP_HOST
+  load_env_var SMTP_PORT
+  load_env_var SMTP_USER
+  load_env_var SMTP_PASS
+  load_env_var SMTP_FROM
+  load_env_var SMTP_FROM_NAME
+  # Preserve generated secrets across reruns.
+  load_env_var JWT_SECRET
+  load_env_var JWT_REFRESH_SECRET
+  load_env_var CSRF_SECRET
+  load_env_var SUPERADMIN_PASSWORD
+fi
+
 # ============================================================
 # Phase 5 — interactive configuration
 # ============================================================
 banner "Phase 5 — Configuration"
 
 note "Press ENTER to accept defaults shown in [brackets]. Pre-set env vars are picked up automatically."
+if [ "$ENV_PRELOADED" -eq 1 ]; then
+  note "Existing .env detected — its values are pre-filled below; press ENTER to keep each."
+fi
 echo
 
 prompt DOMAIN "Production domain (e.g. api.salessphere.com)"
@@ -236,7 +301,7 @@ prompt CORS_ORIGIN "Frontend origin (CORS allowed)" "https://app.${DOMAIN#api.}"
 prompt SUPERADMIN_EMAIL "Platform super-admin email" "admin@${DOMAIN#api.}"
 is_email "$SUPERADMIN_EMAIL" || fail "Invalid email: $SUPERADMIN_EMAIL"
 
-prompt_secret DATABASE_URL "DATABASE_URL (DO Managed Postgres connection string)"
+prompt_secret DATABASE_URL "DATABASE_URL (Neon or DO Managed Postgres connection string)"
 is_pgurl "$DATABASE_URL" || fail "DATABASE_URL must start with postgresql:// or postgres://"
 
 prompt GHCR_USER "GHCR username" "AsimAftab"
@@ -260,11 +325,20 @@ prompt SMTP_FROM_NAME "SMTP from name" "SalesSphere"
 # ============================================================
 banner "Phase 6 — Generating secrets + rendering config"
 
-JWT_SECRET="$(gen_secret)"
-JWT_REFRESH_SECRET="$(gen_secret)"
-CSRF_SECRET="$(gen_secret)"
-SUPERADMIN_PASSWORD="$(gen_secret)"
-step "Generated 4 random secrets (JWT × 2, CSRF, super-admin password)"
+# Reuse any secret that was preserved from an existing .env (idempotent
+# rerun). Rotating these on every run would invalidate sessions and
+# render the saved credentials-summary stale. Generate only what's missing.
+GENERATED_COUNT=0
+PRESERVED_COUNT=0
+for var in JWT_SECRET JWT_REFRESH_SECRET CSRF_SECRET SUPERADMIN_PASSWORD; do
+  if [ -n "${!var:-}" ]; then
+    PRESERVED_COUNT=$((PRESERVED_COUNT + 1))
+  else
+    printf -v "$var" '%s' "$(gen_secret)"
+    GENERATED_COUNT=$((GENERATED_COUNT + 1))
+  fi
+done
+step "Secrets ready: ${GENERATED_COUNT} generated, ${PRESERVED_COUNT} preserved from existing .env (JWT × 2, CSRF, super-admin password)"
 
 # Back up existing .env if present (idempotent re-runs)
 if [ -f .env ] && ! cmp -s .env .env.example; then
@@ -348,7 +422,14 @@ sed -i.tmp "s|api\.salessphere\.com|${DOMAIN}|g" Caddyfile && rm -f Caddyfile.tm
 banner "Phase 7 — GHCR login + image pull"
 
 step "Logging in to ghcr.io as $GHCR_USER"
-echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin > /dev/null
+if ! echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin > /dev/null 2>&1; then
+  fail "GHCR login failed for user '$GHCR_USER'.
+       The Personal Access Token must:
+         • belong to a user with read access to $GHCR_IMAGE,
+         • have the 'read:packages' scope (classic) or 'Packages: read' permission (fine-grained),
+         • not be expired.
+       Generate a new one at https://github.com/settings/tokens (classic) and re-run this script."
+fi
 
 # Make the auth cred available to deploy too (CI runs as deploy via SSH).
 mkdir -p "${DEPLOY_HOME}/.docker"
