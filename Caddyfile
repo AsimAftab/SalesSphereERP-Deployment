@@ -11,7 +11,20 @@
 # `docker compose up`.
 
 api.salessphere.com {
-    # Forward to the `app` service on the internal docker network.
+    # Forward everything to the `app` service on the internal docker network.
+    # This catch-all covers the REST API (/api/v1/*), the health checks, AND the
+    # Socket.io live-tracking endpoint (path /realtime, namespace /v1/tracking).
+    #
+    # WebSockets: no special config needed. Caddy's reverse_proxy detects the
+    # `Connection: Upgrade` / `Upgrade: websocket` handshake and proxies it
+    # transparently (unlike nginx, which needs explicit Upgrade headers). Do NOT
+    # add a separate /realtime block or header rewrites — the catch-all already
+    # streams the WebSocket. See backend docs/live-tracking-socket.md.
+    #
+    # NOTE: single `app` instance today, so Socket.io's polling handshake is
+    # fine. If you scale `app` horizontally, either pin transport to websocket
+    # or add sticky sessions (lb_policy + cookie) so the handshake stays on one
+    # backend; the Redis adapter already handles cross-instance broadcasts.
     reverse_proxy app:3000
 
     # Compression — saves bandwidth, costs almost no CPU.
