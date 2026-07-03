@@ -17,7 +17,7 @@
 
 services:
   app:
-    image: ghcr.io/asimaftab/salessphere-backend:${IMAGE_TAG:-latest}
+    image: ghcr.io/asimaftab/salessphere-erp-backend:${IMAGE_TAG:-latest}
     container_name: salessphere-app
     restart: unless-stopped
     env_file: .env

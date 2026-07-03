@@ -18,7 +18,7 @@ SalesSphere-ERP/
     └── README.md                you are here
 ```
 
-The backend repo's CI builds the Docker image and pushes it to `ghcr.io/asimaftab/salessphere-backend:sha-<short-sha>`. This repo just orchestrates pulling that image + running migrations + restarting Caddy/Redis around it.
+The backend repo's CI builds the Docker image and pushes it to `ghcr.io/asimaftab/salessphere-erp-backend:sha-<short-sha>`. This repo just orchestrates pulling that image + running migrations + restarting Caddy/Redis around it.
 
 ## Architecture
 
@@ -156,7 +156,7 @@ Two ways:
 ```bash
 ssh deploy@<droplet>
 cd ~/SalesSphereERP-Deployment
-docker images ghcr.io/asimaftab/salessphere-backend           # see tagged builds
+docker images ghcr.io/asimaftab/salessphere-erp-backend       # see tagged builds
 ./update.sh sha-1a2b3c4                                       # roll back to a specific build
 ```
 

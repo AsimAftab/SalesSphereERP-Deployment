@@ -46,7 +46,7 @@ DEPLOY_USER="deploy"
 DEPLOY_HOME="/home/${DEPLOY_USER}"
 REPO_URL="https://github.com/AsimAftab/SalesSphereERP-Deployment.git"
 REPO_DIR="${DEPLOY_HOME}/SalesSphereERP-Deployment"
-GHCR_IMAGE_DEFAULT="ghcr.io/asimaftab/salessphere-backend"
+GHCR_IMAGE_DEFAULT="ghcr.io/asimaftab/salessphere-erp-backend"
 SUMMARY_FILE="${DEPLOY_HOME}/credentials-summary.txt"
 
 if [ -t 1 ]; then
