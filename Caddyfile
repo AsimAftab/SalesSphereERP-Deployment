@@ -7,10 +7,11 @@
 #   2. Ports 80 and 443 are open in the DO firewall (they're open by
 #      default on a fresh droplet).
 #
-# Edit `api.salessphere.com` to your real production hostname before
-# `docker compose up`.
+# Production hostname. If this ever changes, update it here and commit —
+# do NOT hand-edit it only on the droplet, the CI deploy runs
+# `git reset --hard origin/main` and would wipe an uncommitted change.
 
-api.salessphere.com {
+salessphere360.tech {
     # Forward everything to the `app` service on the internal docker network.
     # This catch-all covers the REST API (/api/v1/*), the health checks, AND the
     # Socket.io live-tracking endpoint (path /realtime, namespace /v1/tracking).
