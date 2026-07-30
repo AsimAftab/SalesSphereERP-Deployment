@@ -179,6 +179,15 @@ if [ "$RESUME" -eq 1 ] && [ "${INSTALL_LIB_ONLY:-0}" != "1" ]; then
   done
   if [ "$last_done" -eq 0 ]; then
     note "No recorded progress — starting from phase 1."
+  elif [ "$last_done" -ge "$TOTAL_PHASES" ]; then
+    # Every phase is recorded, so a literal resume would jump to the summary
+    # and re-print it without touching anything — which is how a run ends up
+    # reporting on a stack it never looked at. Re-run the verifying half
+    # instead: preflight, migrations, stack, health. Phases 1-7 are
+    # provisioning and a pull; they rarely need repeating.
+    FROM_PHASE=8
+    note "All phases already recorded — re-running the checks (phase ${FROM_PHASE} onwards)."
+    note "Use --from=1 to redo provisioning as well."
   else
     # Resume AT the last completed phase, not after it. Phases are
     # idempotent, and re-running the one that "passed" is cheap insurance
@@ -863,11 +872,16 @@ $(printf '%s' "$out" | grep -E 'Error|error:' | head -3)"
 # ============================================================
 # Phase 9 — migrations + seed
 # ============================================================
-SEED_OK=0
+# Tri-state, not a boolean. `--resume` skips phases, so "did the seed
+# succeed" and "was the seed even attempted this run" are different
+# questions, and answering the second with the first is how a summary ends
+# up asserting something it never checked.
+SEED_STATE="not-run"   # not-run | ok | failed | skipped
 phase_migrate() {
   cd "$REPO_DIR"
 
   if [ "$DB_REACHABLE" -ne 1 ]; then
+    SEED_STATE="failed"
     issue "Skipping migrations and seed — the database is not reachable (see phase 8)."
     return 1
   fi
@@ -877,6 +891,7 @@ phase_migrate() {
     bunx prisma migrate deploy || return 1
 
   if [ "$SKIP_SEED" -eq 1 ]; then
+    SEED_STATE="skipped"
     note "Seed skipped (--skip-seed)"
     return 0
   fi
@@ -885,9 +900,9 @@ phase_migrate() {
   # Failure here used to be swallowed with `|| true`, and the summary went
   # on to print a super-admin password for an account that did not exist.
   if IMAGE_TAG="$IMAGE_TAG" docker compose run --rm --no-deps app bun run db:seed; then
-    SEED_OK=1
+    SEED_STATE="ok"
   else
-    SEED_OK=0
+    SEED_STATE="failed"
     issue "Super-admin seed failed — no platform admin account was created.
        Re-run it alone once the cause is fixed:
          cd ${REPO_DIR} && docker compose run --rm app bun run db:seed"
@@ -936,28 +951,65 @@ phase_start() {
 phase_summary() {
   cd "$REPO_DIR"
 
+  # A skipped phase leaves its variables unset, so anything asserted from
+  # them would be invented. Re-establish the facts that are cheap to check.
+  if [ -z "${DROPLET_IP:-}" ] || [ "$DROPLET_IP" = "unknown" ]; then
+    DROPLET_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo 'unknown')"
+  fi
+
+  # The live answer beats whatever this process happened to observe: on a
+  # --resume the stack has usually been running for a while already.
+  local health_live=0
+  curl -fsS --max-time 5 http://localhost:3000/health/ready > /dev/null 2>&1 && health_live=1
+
   local seed_block
-  if [ "$SEED_OK" -eq 1 ]; then
-    seed_block="  URL:       https://${DOMAIN}/api/v1/auth/login
+  case "$SEED_STATE" in
+    ok)
+      seed_block="  URL:       https://${DOMAIN}/api/v1/auth/login
   Email:     ${SUPERADMIN_EMAIL}
   Password:  ${SUPERADMIN_PASSWORD}
 
   → After first login, POST /api/v1/auth/forgot-password and reset it."
-  elif [ "$SKIP_SEED" -eq 1 ]; then
-    seed_block="  NOT SEEDED — you passed --skip-seed.
-  The password below is in .env and will be used when you do seed:
+      ;;
+    skipped)
+      seed_block="  NOT SEEDED — you passed --skip-seed.
+  .env will use this password when you do seed:
     ${SUPERADMIN_PASSWORD}
   Run: cd ${REPO_DIR} && docker compose run --rm app bun run db:seed"
-  else
-    seed_block="  !! NO SUPER-ADMIN ACCOUNT EXISTS — the seed did not succeed.
-  The password below is what .env will use once the seed runs:
+      ;;
+    failed)
+      seed_block="  !! NO SUPER-ADMIN ACCOUNT EXISTS — the seed did not succeed.
+  .env will use this password once the seed runs:
     ${SUPERADMIN_PASSWORD}
   Fix the cause, then: cd ${REPO_DIR} && docker compose run --rm app bun run db:seed"
+      ;;
+    *)
+      # Phase 9 did not run at all this time (--resume / --from past it).
+      # Saying either "created" or "does not exist" would be a guess.
+      seed_block="  NOT CHECKED this run — phase 9 was skipped, so the account's state
+  is unknown. .env holds this password:
+    ${SUPERADMIN_PASSWORD}
+  Verify by signing in, or re-run the seed (it is idempotent):
+    cd ${REPO_DIR} && docker compose run --rm app bun run db:seed"
+      ;;
+  esac
+
+  # The health line is a live probe, not a recollection — on a --resume
+  # nothing in this process ever touched the stack.
+  if [ "$health_live" -eq 1 ]; then
+    HEALTH_OK=1
+  else
+    HEALTH_OK=0
+    issue "http://localhost:3000/health/ready is not responding right now."
   fi
 
   local issues_block="  None."
   if [ ${#ISSUES[@]} -gt 0 ]; then
     issues_block=$(printf '  • %s\n' "${ISSUES[@]}")
+  fi
+  if [ "$SEED_STATE" = "not-run" ]; then
+    issues_block="${issues_block}
+  • Super-admin account state was not verified this run (phase 9 skipped)."
   fi
 
   cat > "$SUMMARY_FILE" <<EOF
@@ -1065,7 +1117,11 @@ run_phase 11 "Summary"              phase_summary
 # Verdict
 # ============================================================
 echo
-if [ ${#ISSUES[@]} -eq 0 ]; then
+# The verdict is derived from the SAME facts the summary printed. It used to
+# read only this process's ISSUES array, so `--resume` to the last phase
+# recorded nothing, found the array empty, and announced "everything came up
+# green" directly beneath a summary saying no super-admin account existed.
+if [ ${#ISSUES[@]} -eq 0 ] && [ "${HEALTH_OK:-0}" -eq 1 ] && [ "$SEED_STATE" != "failed" ]; then
   banner "✓ Setup complete"
   echo -e "${GREEN}${BOLD}Everything came up green.${NC}"
   echo -e "Summary: ${BOLD}${SUMMARY_FILE}${NC} (chmod 600)"
