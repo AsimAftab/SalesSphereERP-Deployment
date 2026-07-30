@@ -9,12 +9,14 @@ SalesSphere-ERP/
 ├── SalesSphereERP-Backend/      ← source repo (Bun + Prisma + Express)
 │                                  CI builds + pushes the Docker image to GHCR.
 ├── SalesSphereERP-Frontend/     ← Vite + React (separate concern)
-└── SalesSphereERP-Deployment/   ← THIS REPO — what runs on the droplet.
+└── SalesSphereERP-Deployment/   ← THIS REPO — what runs on the server.
     ├── docker-compose.yml       app (from GHCR) + redis + caddy
-    ├── Caddyfile                reverse-proxy + auto Let's Encrypt
-    ├── .env.example             production env template (used by install.sh)
-    ├── install.sh               one-command droplet bootstrap (the magic)
-    ├── update.sh                manual deploy / rollback (CI uses the same commands)
+    ├── Caddyfile.template       reverse-proxy config; install.sh renders it
+    │                              to ./Caddyfile (gitignored) with your domain
+    ├── .env.example             production env template
+    ├── install.sh               server bootstrap — resumable, see below
+    ├── update.sh                manual deploy / rollback
+    ├── test-install.sh          tests for install.sh's URL + phase handling
     └── README.md                you are here
 ```
 
@@ -58,7 +60,7 @@ That's it. The script walks through every step interactively in ~1 minute:
 6. Prompts for: production domain, DATABASE_URL (Neon **or** DigitalOcean Managed Postgres — both speak vanilla Postgres), GHCR token, SMTP creds (skippable), super-admin email
 7. **Auto-generates** JWT_SECRET, JWT_REFRESH_SECRET, CSRF_SECRET, SUPERADMIN_PASSWORD (random 48-char base64). On a rerun these are **preserved** from the existing `.env` so live sessions and the saved credentials summary stay valid.
 8. Renders `.env` from the gathered values
-9. Renders `Caddyfile` with your real hostname (substitutes the `api.salessphere.com` placeholder)
+9. Renders `Caddyfile` from `Caddyfile.template`, substituting your real hostname for `{{DOMAIN}}`
 10. Logs in to GHCR + pulls the app image (copies the docker-config.json to the deploy user too)
 11. Pre-checks DNS — warns if your A record doesn't resolve to this droplet's IP yet (Caddy needs that for the TLS handshake)
 12. Applies pending Prisma migrations (one-shot container, same image)
@@ -66,7 +68,7 @@ That's it. The script walks through every step interactively in ~1 minute:
 14. Brings up `docker compose up -d` + smoke-tests `/health/ready` with retries
 15. Saves a credentials summary to `/home/deploy/credentials-summary.txt` (chmod 600) — has the auto-generated super-admin password, GitHub secrets to add, outstanding manual steps
 
-**Idempotent** — safe to re-run if something fails partway. On a rerun the script reads the existing `.env`, pre-fills every prompt with its current value (press ENTER to keep, type to override), and reuses the auto-generated secrets so JWT sessions and the saved super-admin password stay valid. The previous `.env` and `Caddyfile` are still backed up to `.bak.<timestamp>` before being rewritten.
+**Idempotent and resumable** — see [When it fails partway](#when-it-fails-partway--dont-start-over). On a rerun the script reads the existing `.env`, pre-fills every prompt with its current value (ENTER keeps it), and reuses the generated secrets so JWT sessions and the saved super-admin password stay valid. The previous `.env` and `Caddyfile` are backed up to `.bak.<timestamp>` first.
 
 ### Pre-set values via env vars (skip prompts entirely)
 
@@ -86,6 +88,61 @@ bash install.sh
 ```
 
 Any vars you don't set, the script prompts for. Mixed mode is fine — set what you have, get prompted for the rest.
+
+### When it fails partway — don't start over
+
+Every phase is idempotent and completed phases are recorded in
+`/var/lib/salessphere-erp/install-state`, so a failure does not mean redoing
+the apt installs and re-answering fifteen prompts:
+
+```bash
+sudo bash install.sh --resume -y     # continue where it stopped, ask nothing
+sudo bash install.sh --from=9 -y     # re-run one phase onwards
+sudo bash install.sh --help          # phase numbers and all flags
+```
+
+`-y` reuses everything already saved in `.env`. The one value never stored
+there is the GHCR token, so pass it when re-running phase 7:
+
+```bash
+sudo GHCR_TOKEN=ghp_xxx bash install.sh --from=7 -y
+```
+
+The script **exits non-zero if anything failed**, and the summary lists what
+needs attention rather than printing an unconditional success banner. It will
+not hand you a super-admin password for an account the seed failed to create.
+The full transcript is kept at `/var/log/salessphere-install.log`.
+
+### Database TLS
+
+`sslmode=require` is not enough on its own. The driver treats it as
+`verify-full`, so it needs a CA it trusts, and Node ships none for Amazon RDS
+or DigitalOcean.
+
+For **Amazon RDS** the script handles this: it detects the host, confirms the
+app image actually ships `certs/rds-global-bundle.pem`, and rewrites
+`DATABASE_URL` to `?sslmode=verify-full&sslrootcert=/app/certs/rds-global-bundle.pem`.
+That parameter is load-bearing for `prisma migrate` specifically — the
+migration engine is a separate Rust binary that reads only the connection
+string, and without it fails with `self signed certificate in certificate
+chain` or a bare, misleading `P1001: Can't reach database server`.
+
+For any **other provider running its own CA**, put its root on the server and
+name it yourself; an explicit `sslrootcert` is never overridden:
+
+```
+DATABASE_URL=postgresql://…/db?sslmode=verify-full&sslrootcert=/path/to/ca.pem
+```
+
+### Tests
+
+`install.sh`'s string handling rewrites the production connection string, and
+a bad substitution fails at connect time with an error that points nowhere
+near the cause. It is covered:
+
+```bash
+bash test-install.sh
+```
 
 ### Outstanding manual steps after the script
 

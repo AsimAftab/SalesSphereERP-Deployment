@@ -7,11 +7,19 @@
 #   2. Ports 80 and 443 are open in the DO firewall (they're open by
 #      default on a fresh droplet).
 #
-# Production hostname. If this ever changes, update it here and commit —
-# do NOT hand-edit it only on the droplet, the CI deploy runs
-# `git reset --hard origin/main` and would wipe an uncommitted change.
+# TEMPLATE — install.sh renders this to ./Caddyfile, substituting {{DOMAIN}}.
+# The rendered Caddyfile is gitignored, so the deploy's
+# `git reset --hard origin/main` no longer wipes it.
+#
+# This was previously a committed Caddyfile with the hostname baked in, which
+# install.sh rewrote via `sed s|api.salessphere.com|$DOMAIN|`. Once the real
+# hostname was committed that pattern matched nothing — the script reported
+# "Rendering Caddyfile (domain: X)" and changed nothing, so deploying on any
+# other domain silently kept serving the old one. A placeholder cannot fail
+# that way: unsubstituted, Caddy refuses to start rather than quietly serving
+# the wrong host.
 
-salessphere360.tech {
+{{DOMAIN}} {
     # Forward everything to the `app` service on the internal docker network.
     # This catch-all covers the REST API (/api/v1/*), the health checks, AND the
     # Socket.io live-tracking endpoint (path /realtime, namespace /v1/tracking).

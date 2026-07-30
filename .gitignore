@@ -2,6 +2,13 @@
 .env
 .env.local
 .env.production
+.env.bak.*
+
+# Rendered from Caddyfile.template by install.sh. Generated, not authored —
+# committing it is exactly what turned the domain substitution into a silent
+# no-op, since the sed pattern no longer matched the baked-in hostname.
+Caddyfile
+Caddyfile.bak.*
 
 # OS / editor noise
 .DS_Store
