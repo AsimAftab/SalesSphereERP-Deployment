@@ -295,14 +295,21 @@ is_pgurl() { [[ "$1" =~ ^postgres(ql)?:// ]]; }
 
 # Pre-fill a variable from an existing .env. Caller-supplied env vars and
 # earlier prompts win; this only fills what is still empty.
+#
+# The `|| true` is load-bearing. Under `set -o pipefail`, grep finding
+# nothing fails the whole pipeline, which fails the assignment, which under
+# `set -e` kills the script — with no message at all. A key simply being
+# absent from .env is the normal case, not an error, and without this the
+# run died silently between phases on any .env that lacked one.
 load_env_var() {
   local key="$1" var="${2:-$1}" file="${3:-.env}"
   [ -f "$file" ] || return 0
   [ -z "${!var:-}" ] || return 0
   local val
-  val=$(grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | sed -E "s/^${key}=//")
+  val=$(grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | sed -E "s/^${key}=//") || true
   [ -n "$val" ] || return 0
   printf -v "$var" '%s' "$val"
+  return 0
 }
 
 # --- Database URL helpers -------------------------------------------------
@@ -489,9 +496,11 @@ load_config() {
   ENV_PRELOADED=1
 
   # DOMAIN isn't a literal .env key — recover it from APP_URL=https://<host>.
+  # `|| true` for the same reason as load_env_var: a missing APP_URL is a
+  # thing to prompt for, not a reason to die without saying anything.
   if [ -z "${DOMAIN:-}" ]; then
     DOMAIN=$(grep -E '^APP_URL=' .env 2>/dev/null \
-      | head -n1 | sed -E 's|^APP_URL=https?://||' | cut -d/ -f1)
+      | head -n1 | sed -E 's|^APP_URL=https?://||' | cut -d/ -f1) || true
   fi
   load_env_var CORS_ORIGIN
   load_env_var SUPERADMIN_EMAIL
@@ -580,10 +589,12 @@ phase_render() {
   # cannot abort the write. Belt to the braces of prompt_secret always
   # defining its variable.
   local v
-  for v in IMAGE_TAG CORS_ORIGIN SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS \
-           SMTP_FROM SMTP_FROM_NAME; do
+  for v in IMAGE_TAG GHCR_IMAGE CORS_ORIGIN SMTP_HOST SMTP_PORT SMTP_USER \
+           SMTP_PASS SMTP_FROM SMTP_FROM_NAME; do
     printf -v "$v" '%s' "${!v:-}"
   done
+  : "${IMAGE_TAG:=latest}"
+  : "${GHCR_IMAGE:=$GHCR_IMAGE_DEFAULT}"
 
   step "Rendering .env"
   # Written to a temp file and moved into place: `cat > .env` truncates
@@ -598,6 +609,7 @@ phase_render() {
 
 # --- Image ---
 IMAGE_TAG=${IMAGE_TAG}
+GHCR_IMAGE=${GHCR_IMAGE}
 
 # --- Server ---
 NODE_ENV=production
@@ -709,6 +721,11 @@ phase_image() {
     "${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}" 2>/dev/null || echo '')
   [ -n "$digest" ] && dim "Digest: ${digest##*@}"
   [ -n "$built" ] && dim "Built:  ${built}"
+  # Explicit, and not decoration: a function ending in a conditional returns
+  # that conditional's status. With no digest to print, `[ -n "" ]` is false,
+  # the function returns 1, and run_phase reports a failed image pull that in
+  # fact succeeded. Same trap the `prompt` helper documents.
+  return 0
 }
 
 # ============================================================
@@ -820,6 +837,10 @@ $(printf '%s' "$out" | grep -E 'Error|error:' | head -3)"
       fi
     fi
   fi
+  # Preflight only ever *reports*; it must not fail the phase. Its findings
+  # reach the summary through `issue`, and the phases that depend on them
+  # (migrations) check DB_REACHABLE for themselves.
+  return 0
 }
 
 # ============================================================

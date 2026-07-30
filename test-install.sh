@@ -160,6 +160,46 @@ check "critical failure exits non-zero" "1" "$rc"
 
 rm -f "$STATE_FILE"
 
+# ----------------------------------------------------------------------
+# load_env_var must survive a key that is simply absent.
+#
+# Regression: under `set -o pipefail`, grep finding nothing failed the
+# pipeline, failed the assignment, and `set -e` then killed the whole run
+# with NO message. On the server this looked like the script quietly
+# stopping between Phase 4 and Phase 5.
+# ----------------------------------------------------------------------
+echo
+echo "load_env_var"
+
+tmpdir="$(mktemp -d)"; pushd "$tmpdir" > /dev/null
+printf 'APP_URL=https://api.example.test
+IMAGE_TAG=latest
+' > .env
+
+unset PRESENT_KEY ABSENT_KEY
+( set -euo pipefail; load_env_var IMAGE_TAG; ) > /dev/null 2>&1
+check "present key does not abort"  "0" "$?"
+( set -euo pipefail; load_env_var GHCR_IMAGE; ) > /dev/null 2>&1
+check "ABSENT key does not abort"   "0" "$?"
+
+IMAGE_TAG=""; load_env_var IMAGE_TAG
+check "reads the value"             "latest" "$IMAGE_TAG"
+
+IMAGE_TAG="pinned"; load_env_var IMAGE_TAG
+check "does not clobber a set value" "pinned" "$IMAGE_TAG"
+
+# The whole preamble, as run_phase would reach it.
+unset DOMAIN
+( set -euo pipefail
+  DOMAIN=$(grep -E '^APP_URL=' .env 2>/dev/null | head -n1 | sed -E 's|^APP_URL=https?://||' | cut -d/ -f1) || true
+  for k in CORS_ORIGIN SUPERADMIN_EMAIL DATABASE_URL GHCR_IMAGE SMTP_PASS; do
+    load_env_var "$k"
+  done
+) > /dev/null 2>&1
+check "a whole load_config pass survives a sparse .env" "0" "$?"
+
+popd > /dev/null; rm -rf "$tmpdir"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "All ${PASS} checks passed."
