@@ -1,0 +1,10 @@
+# These files are executed on Linux. A CRLF checkout makes bash fail on the
+# shebang with `bad interpreter: /usr/bin/env bash^M` — an error that names
+# neither the file nor the real problem, on a server, during a deploy.
+# Pin them to LF regardless of the committer's platform or core.autocrlf.
+*.sh        text eol=lf
+Caddyfile*  text eol=lf
+Dockerfile* text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.pem       text eol=lf
