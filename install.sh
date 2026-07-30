@@ -546,8 +546,10 @@ phase_config() {
 
   prompt GHCR_USER "GHCR username" "AsimAftab"
   prompt_secret GHCR_TOKEN "GHCR Personal Access Token (read:packages scope)"
-  [ -n "${GHCR_TOKEN:-}" ] || fail "GHCR_TOKEN is required to pull the app image.
-       Generate one at https://github.com/settings/tokens (classic, read:packages)."
+  # Deliberately NOT fatal here. The token is never stored in .env, so every
+  # `--resume -y` would demand it again — even when the image is already on
+  # the host and nothing needs pulling. Phase 7 decides, because only it
+  # knows whether a pull is actually required.
 
   prompt GHCR_IMAGE "GHCR image (no tag)" "$GHCR_IMAGE_DEFAULT"
   prompt IMAGE_TAG "Image tag to deploy" "latest"
@@ -691,6 +693,21 @@ EOF
 # ============================================================
 phase_image() {
   cd "$REPO_DIR"
+  local image="${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}"
+
+  # No token: fine, as long as the image is already here. Re-running after a
+  # failure is the common case, and the image rarely changed in between.
+  if [ -z "${GHCR_TOKEN:-}" ]; then
+    if docker image inspect "$image" > /dev/null 2>&1; then
+      issue "No GHCR_TOKEN given — using the ${IMAGE_TAG} image already on this host, which may be stale.
+       To pull a newer build:  sudo GHCR_TOKEN=ghp_xxx bash $0 --resume -y"
+      return 0
+    fi
+    fail "GHCR_TOKEN is required: ${image} is not on this host, so it has to be pulled.
+       Supply it for this run (sudo passes VAR=value through):
+         sudo GHCR_TOKEN=ghp_xxx bash $0 --resume -y
+       Generate one at https://github.com/settings/tokens (classic, read:packages)."
+  fi
 
   step "Logging in to ghcr.io as $GHCR_USER"
   if ! echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin > /dev/null 2>&1; then
@@ -709,16 +726,16 @@ phase_image() {
   chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.docker"
   chmod 600 "${DEPLOY_HOME}/.docker/config.json"
 
-  step "Pulling ${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}"
+  step "Pulling ${image}"
   IMAGE_TAG="$IMAGE_TAG" docker compose pull
 
   # Which build is actually running. `latest` is a moving target, and
   # "deployed successfully" against a stale image is a confusing hour.
   local digest built
   digest=$(docker image inspect --format '{{index .RepoDigests 0}}' \
-    "${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}" 2>/dev/null || echo '')
+    "$image" 2>/dev/null || echo '')
   built=$(docker image inspect --format '{{.Created}}' \
-    "${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}" 2>/dev/null || echo '')
+    "$image" 2>/dev/null || echo '')
   [ -n "$digest" ] && dim "Digest: ${digest##*@}"
   [ -n "$built" ] && dim "Built:  ${built}"
   # Explicit, and not decoration: a function ending in a conditional returns
@@ -1034,14 +1051,6 @@ if [ "$FROM_PHASE" -gt 5 ]; then
        Run the configuration phase too:
          sudo bash $0 --from=5 -y"
   done
-  # Phase 7 needs a token, and it is deliberately never written to .env.
-  if [ "$FROM_PHASE" -le 7 ] && [ -z "${GHCR_TOKEN:-}" ] && [ "$NON_INTERACTIVE" -eq 1 ]; then
-    fail "Phase 7 needs GHCR_TOKEN, which is never stored in .env.
-       Supply it for this run:
-         sudo GHCR_TOKEN=ghp_xxx bash $0 --from=${FROM_PHASE} -y
-       Or skip straight past the pull if the image is already present:
-         sudo bash $0 --from=8 -y"
-  fi
 fi
 
 run_phase 5  "Configuration"        phase_config
