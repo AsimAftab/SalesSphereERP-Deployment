@@ -1,239 +1,170 @@
 # SalesSphereERP-Deployment
 
-Production deployment topology for the [SalesSphere ERP backend](https://github.com/AsimAftab/SalesSphere-Backend-ERP). Lives on the DigitalOcean Ubuntu droplet, owns the docker-compose stack, the Caddy reverse-proxy config, and the production `.env`.
+Provider-neutral production deployment for the SalesSphere ERP API and web
+frontend. Application images are pulled from GHCR; only Caddy publishes server
+ports.
 
-## What's where
+## Topology
 
-```
-SalesSphere-ERP/
-├── SalesSphereERP-Backend/      ← source repo (Bun + Prisma + Express)
-│                                  CI builds + pushes the Docker image to GHCR.
-├── SalesSphereERP-Frontend/     ← Vite + React (separate concern)
-└── SalesSphereERP-Deployment/   ← THIS REPO — what runs on the server.
-    ├── docker-compose.yml       app (from GHCR) + redis + caddy
-    ├── Caddyfile.template       reverse-proxy config; install.sh renders it
-    │                              to ./Caddyfile (gitignored) with your domain
-    ├── .env.example             production env template
-    ├── install.sh               server bootstrap — resumable, see below
-    ├── update.sh                manual deploy / rollback
-    ├── test-install.sh          tests for install.sh's URL + phase handling
-    └── README.md                you are here
+```text
+API_DOMAIN ───────┐
+                  ├─ Caddy :80/:443 ── app:3000 ── managed Postgres
+FRONTEND_DOMAIN ──┘             └───── frontend:8080
+                                      app ── redis:6379
 ```
 
-The backend repo's CI builds the Docker image and pushes it to `ghcr.io/asimaftab/salessphere-erp-backend:sha-<short-sha>`. This repo just orchestrates pulling that image + running migrations + restarting Caddy/Redis around it.
+Services:
 
-## Architecture
+- `app` — backend image
+  `ghcr.io/asimaftab/salessphere-erp-backend:${IMAGE_TAG:-latest}`.
+  The service name and `IMAGE_TAG` remain compatible with existing automation.
+- `frontend` — internal-only web image
+  `ghcr.io/asimaftab/salessphere-erp-frontend:${FRONTEND_IMAGE_TAG:-latest}`.
+- `redis` — internal-only BullMQ storage with AOF persistence.
+- `caddy` — automatic TLS, compression, security headers, JSON access logs,
+  API/WebSocket proxying, and frontend proxying.
 
-```
-                       ┌──────────────────────────────────────┐
-   Public Internet ───▶│ Caddy (80/443)  ─── auto Let's Encrypt
-                       │     │
-                       │     ▼ reverse_proxy
-                       │ app:3000  ◀── image: ghcr.io/.../sha-<sha>
-                       │     │
-                       │     ▼ REDIS_URL=redis://redis:6379
-                       │  redis:6379  (internal-only, AOF persistence)
-                       └─────┬────────────────────────────────┘
-                             │
-                             ▼ DATABASE_URL
-                  DigitalOcean Managed Postgres (Bangalore)
-                   — separate from the droplet, has its own
-                     daily backups + PITR
-```
+## First installation
 
-## First-time droplet setup — one command
-
-Provision a fresh Ubuntu 22.04+ droplet on DigitalOcean (1 vCPU / 1 GB RAM is plenty for v1), then SSH in as root and run:
+Use an Ubuntu 22.04+ server with ports 22, 80, and 443 available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AsimAftab/SalesSphereERP-Deployment/main/install.sh -o install.sh
-bash install.sh
+sudo bash install.sh
 ```
 
-That's it. The script walks through every step interactively in ~1 minute:
-
-1. Installs Docker Engine + Compose plugin + UFW + base utilities (openssl, jq, curl, git)
-2. Configures the firewall (allow SSH + HTTP + HTTPS)
-3. Creates the non-root `deploy` user (sudo + docker groups)
-4. Prompts you to paste the GitHub Actions deploy SSH **public** key
-5. Clones this repo into `/home/deploy/SalesSphereERP-Deployment`
-6. Prompts for: production domain, DATABASE_URL (Neon **or** DigitalOcean Managed Postgres — both speak vanilla Postgres), GHCR token, SMTP creds (skippable), super-admin email
-7. **Auto-generates** JWT_SECRET, JWT_REFRESH_SECRET, CSRF_SECRET, SUPERADMIN_PASSWORD (random 48-char base64). On a rerun these are **preserved** from the existing `.env` so live sessions and the saved credentials summary stay valid.
-8. Renders `.env` from the gathered values
-9. Renders `Caddyfile` from `Caddyfile.template`, substituting your real hostname for `{{DOMAIN}}`
-10. Logs in to GHCR + pulls the app image (copies the docker-config.json to the deploy user too)
-11. Pre-checks DNS — warns if your A record doesn't resolve to this droplet's IP yet (Caddy needs that for the TLS handshake)
-12. Applies pending Prisma migrations (one-shot container, same image)
-13. Seeds the platform super-admin (idempotent — safe to re-run)
-14. Brings up `docker compose up -d` + smoke-tests `/health/ready` with retries
-15. Saves a credentials summary to `/home/deploy/credentials-summary.txt` (chmod 600) — has the auto-generated super-admin password, GitHub secrets to add, outstanding manual steps
-
-**Idempotent and resumable** — see [When it fails partway](#when-it-fails-partway--dont-start-over). On a rerun the script reads the existing `.env`, pre-fills every prompt with its current value (ENTER keeps it), and reuses the generated secrets so JWT sessions and the saved super-admin password stay valid. The previous `.env` and `Caddyfile` are backed up to `.bak.<timestamp>` first.
-
-### Pre-set values via env vars (skip prompts entirely)
-
-For repeatable provisioning across multiple droplets:
+The installer is resumable:
 
 ```bash
-DOMAIN=api.salessphere.com \
-DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require \
+sudo bash install.sh --resume -y
+sudo bash install.sh --from=5 -y
+sudo bash install.sh --help
+```
+
+It installs Docker, configures the firewall and `deploy` user, clones this
+repository, preserves existing secrets, renders `.env`, atomically renders and
+validates Caddy, pulls both images, applies backend migrations, seeds the
+platform admin, starts both services, and tests:
+
+- `app`: `/health/ready`
+- `frontend`: `/healthz`
+
+Pre-set values may be supplied:
+
+```bash
+API_DOMAIN=api.example.com \
+FRONTEND_DOMAIN=example.com \
+AUTH_SITE_DOMAIN=example.com \
+MARKETING_URL=https://example.com \
+DATABASE_URL=postgresql://user:password@host:5432/database \
 GHCR_USER=AsimAftab \
-GHCR_TOKEN=ghp_xxxx \
-DEPLOY_SSH_KEY="ssh-ed25519 AAAA... github-deploy" \
-SUPERADMIN_EMAIL=admin@salessphere.com \
-SMTP_HOST=smtp.resend.com \
-SMTP_USER=resend \
-SMTP_PASS=re_xxxx \
-bash install.sh
+GHCR_TOKEN=github-token \
+DEPLOY_SSH_KEY="ssh-ed25519 AAAA..." \
+sudo -E bash install.sh -y
 ```
 
-Any vars you don't set, the script prompts for. Mixed mode is fine — set what you have, get prompted for the rest.
+`AUTH_SITE_DOMAIN` is the explicit SameSite auth boundary. `API_DOMAIN` and
+`FRONTEND_DOMAIN` must each equal it or be a proper subdomain.
+`AUTH_SITE_DOMAIN` itself must be the registrable domain (eTLD+1). Validation
+uses the complete ICANN and PRIVATE Mozilla/publicsuffix.org list vendored at
+`data/public_suffix_list.dat`, including wildcard and exception rules, with no
+runtime network request. Missing or unreadable PSL data fails installation and
+deployment explicitly. For hosted domains, configure the tenant-owned site
+(for example `foo.blogspot.com`), never the provider suffix (`blogspot.com`).
 
-### When it fails partway — don't start over
+Legacy installations preserve every existing rendered `.env` value, including
+Cloudinary, Resend, SMTP, IRD, logging, JWT, refresh, CSRF, and super-admin
+settings.
+The auth site is derived only when one configured host is the exact parent of
+the other. Sibling hosts require explicit `AUTH_SITE_DOMAIN` input; unattended
+migration fails safely rather than guessing from their final labels.
 
-Every phase is idempotent and completed phases are recorded in
-`/var/lib/salessphere-erp/install-state`, so a failure does not mean redoing
-the apt installs and re-answering fifteen prompts:
+The generated `.env` sets `APP_URL`, `CORS_ORIGIN`, `MARKETING_URL`,
+`PASSWORD_RESET_URL`, and `EMAIL_VERIFICATION_URL` from the explicit hosts.
+
+## DNS
+
+Point both host records at the server before expecting automatic TLS:
+
+```text
+API_DOMAIN       -> server public IP
+FRONTEND_DOMAIN  -> server public IP
+```
+
+## Deployments
+
+All deployments use one server-wide `flock`, refresh this repository from
+`origin/main`, and validate a newly rendered Caddy configuration before
+installing it.
 
 ```bash
-sudo bash install.sh --resume -y     # continue where it stopped, ask nothing
-sudo bash install.sh --from=9 -y     # re-run one phase onwards
-sudo bash install.sh --help          # phase numbers and all flags
+./deploy.sh backend [sha-tag]
+./deploy.sh frontend [sha-tag]
+./deploy.sh all [sha-tag]
 ```
 
-`-y` reuses everything already saved in `.env`. The one value never stored
-there is the GHCR token, so pass it when re-running phase 7:
+Backend migrations run from the new image before the running backend is
+replaced. Each service is pulled, started, and health-checked independently.
+On failure, the script exits non-zero, prints logs, identifies the previous
+image, and prints rollback guidance.
+
+`update.sh` remains compatible:
 
 ```bash
-sudo GHCR_TOKEN=ghp_xxx bash install.sh --from=7 -y
+./update.sh                 # backend using .env IMAGE_TAG
+./update.sh sha-abc123      # backend at a specific tag
+./update.sh frontend [tag]
+./update.sh all [tag]
 ```
 
-The script **exits non-zero if anything failed**, and the summary lists what
-needs attention rather than printing an unconditional success banner. It will
-not hand you a super-admin password for an account the seed failed to create.
-The full transcript is kept at `/var/log/salessphere-install.log`.
-
-### Database TLS
-
-`sslmode=require` is not enough on its own. The driver treats it as
-`verify-full`, so it needs a CA it trusts, and Node ships none for Amazon RDS
-or DigitalOcean.
-
-For **Amazon RDS** the script handles this: it detects the host, confirms the
-app image actually ships `certs/rds-global-bundle.pem`, and rewrites
-`DATABASE_URL` to `?sslmode=verify-full&sslrootcert=/app/certs/rds-global-bundle.pem`.
-That parameter is load-bearing for `prisma migrate` specifically — the
-migration engine is a separate Rust binary that reads only the connection
-string, and without it fails with `self signed certificate in certificate
-chain` or a bare, misleading `P1001: Can't reach database server`.
-
-For any **other provider running its own CA**, put its root on the server and
-name it yourself; an explicit `sslrootcert` is never overridden:
-
-```
-DATABASE_URL=postgresql://…/db?sslmode=verify-full&sslrootcert=/path/to/ca.pem
-```
-
-### Tests
-
-`install.sh`'s string handling rewrites the production connection string, and
-a bad substitution fails at connect time with an error that points nowhere
-near the cause. It is covered:
+Manual rollback:
 
 ```bash
-bash test-install.sh
+./deploy.sh backend sha-previous
+./deploy.sh frontend sha-previous
 ```
 
-### Outstanding manual steps after the script
+Database migrations are forward-only; use a compensating migration when
+schema changes must be corrected.
 
-The script prints these at the end (and saves them in the credentials file) — copy them down:
+## Shared GitHub deployment secrets
 
-1. **Point `<your-domain>`'s A record at the droplet IP.** Caddy provisions the TLS cert on the first request to `https://<your-domain>`. Until DNS resolves, only `http://localhost:3000` from inside the droplet works.
-2. **Add 6 GitHub secrets to the backend repo** (Settings → Secrets and variables → Actions): `DROPLET_HOST`, `DROPLET_USER` (`deploy`), `DROPLET_SSH_KEY` (the **private** half of the deploy SSH key), `DROPLET_SSH_PORT` (only if non-22), `DEPLOYMENT_DIR` (`/home/deploy/SalesSphereERP-Deployment`), `HEALTH_URL` (`https://<your-domain>/health/ready`).
-3. **Create a `production` GitHub Environment** (Settings → Environments → New environment). Empty for v1; add deploy approvals when you have a team.
-4. **Change the super-admin password.** Sign in with the auto-generated one in `credentials-summary.txt`, hit `POST /auth/forgot-password`, redeem the email, set your real password.
-5. **Fill in any blanks in `.env`** you skipped during the prompt (Cloudinary, IRD, etc).
-
-## Day-to-day
-
-After the one-command bootstrap above, you should never touch the droplet again. The backend repo's CI handles deploys on every push to `main`:
-
-```
-main push → CI builds → GHCR pushes sha-<short-sha>
-                     → SSH to droplet
-                       → cd to this dir, git pull
-                       → docker compose pull app
-                       → docker compose run --rm app bunx prisma migrate deploy
-                       → docker compose up -d app
-                     → curl health check
-```
-
-When you do need manual intervention:
-
-```bash
-# Roll forward to whatever's tagged `latest` (or pinned in .env's IMAGE_TAG):
-./update.sh
-
-# Pin to a specific build (rollback):
-./update.sh sha-9e34f12
-
-# Tail logs:
-docker compose logs -f app
-docker compose logs -f caddy
-
-# Restart just one service:
-docker compose restart app
-
-# Full reload (rare — usually after editing compose / Caddyfile):
-docker compose down && docker compose up -d
-```
-
-## GitHub secrets the backend's workflow needs
-
-Set these on the **backend repo** (Settings → Secrets and variables → Actions):
+Backend and frontend workflows use the same names:
 
 | Secret | Value |
 |---|---|
-| `DROPLET_HOST` | The droplet's public IP or stable DNS name |
-| `DROPLET_USER` | `deploy` |
-| `DROPLET_SSH_KEY` | Private half of the deploy SSH key (the public half is in `~deploy/.ssh/authorized_keys`) |
-| `DROPLET_SSH_PORT` | Optional; defaults to 22 |
+| `SERVER_HOST` | Server IP or stable SSH hostname |
+| `SERVER_USER` | `deploy` |
+| `SERVER_SSH_KEY` | Private deployment key |
+| `SERVER_SSH_PORT` | SSH port, normally `22` |
 | `DEPLOYMENT_DIR` | `/home/deploy/SalesSphereERP-Deployment` |
-| `HEALTH_URL` | `https://api.salessphere.com/health/ready` |
 
-Plus the GitHub `production` environment (Settings → Environments → New environment) — empty is fine for v1; add deploy approvals when you have a team.
+Create a `production` GitHub Environment for deployment protection rules.
 
-## Rollback
+## Operations
 
-Two ways:
-
-**(a) Via CI** — easiest. Revert the bad commit on `main` in the backend repo. The next push triggers a redeploy of the prior good state.
-
-**(b) Manual on the droplet** — when CI is down, or when you need to pin to an older build than the previous commit:
 ```bash
-ssh deploy@<droplet>
-cd ~/SalesSphereERP-Deployment
-docker images ghcr.io/asimaftab/salessphere-erp-backend       # see tagged builds
-./update.sh sha-1a2b3c4                                       # roll back to a specific build
+docker compose ps
+docker compose logs -f app
+docker compose logs -f frontend
+docker compose logs -f caddy
+docker compose exec app wget -qO- http://localhost:3000/health/ready
+docker compose exec frontend wget -qO- http://localhost:8080/healthz
 ```
 
-Migrations don't roll back automatically — write a new compensating migration if a bad migration shipped. Never reverse a Prisma migration in place.
+The installer writes `/home/deploy/credentials-summary.txt` with server,
+image, health, secret-name, and day-to-day command details.
 
-## Troubleshooting
+## Validation
 
-**`Permission denied (publickey)` from CI** — the public half of the GitHub Actions deploy key isn't in `/home/deploy/.ssh/authorized_keys`, or its permissions are wrong (must be `0600`).
-
-**`docker: command not found` after install** — log out and back in. The `docker` group membership only applies to new shells. (The script itself runs as root so this only affects you when you SSH in as `deploy` later.)
-
-**`error: failed to solve: ghcr.io/...: failed to fetch`** or **`denied: denied`** during install — the GHCR Personal Access Token is missing, expired, or lacks the right scope. The token needs **`read:packages`** (classic tokens) or **Packages: read** (fine-grained tokens) and must belong to a user with read access to the image. Generate one at <https://github.com/settings/tokens>, then re-run `bash install.sh` — your previous answers are pre-filled, you only need to enter the new token. Or log in manually:
 ```bash
-echo $GHCR_TOKEN | docker login ghcr.io -u <user> --password-stdin
+bash -n install.sh deploy.sh update.sh deployment-lib.sh test-install.sh
+bash test-install.sh
+source ./deployment-lib.sh && require_public_suffix_list
+cp .env.example .env
+docker compose config
+rm .env
 ```
 
-**`install.sh` prompts I missed values for** — it's idempotent, just re-run. The current values from `.env` are pre-filled into every prompt (press ENTER to keep), and the existing file is backed up to `.env.bak.<timestamp>` before being rewritten. Or edit `.env` directly with `nano` and `docker compose up -d` to apply.
-
-**Caddy "no certificates" / 502** — your A record probably doesn't point at the droplet yet, OR the firewall blocks ports 80/443. `sudo ufw status` should show both Allow.
-
-**App container restarts on a loop** — `docker compose logs app --tail=100`. Most common: `DATABASE_URL` is wrong / missing, or there's a pending migration that never ran (run `bunx prisma migrate deploy` once).
-
-**`prisma migrate deploy` fails partway** — fix the migration locally, push a new commit. The `_prisma_migrations` row for the failed migration may need manual `prisma migrate resolve --rolled-back <name>` first.
+The GitHub validation workflow also renders and validates the Caddy template
+with the official Caddy image.

@@ -9,6 +9,12 @@
 # no-op, since the sed pattern no longer matched the baked-in hostname.
 Caddyfile
 Caddyfile.bak.*
+Caddyfile.rollback
+.Caddyfile.tmp.*
+.env.tmp.*
+.env.db.tmp.*
+.test-install.*
+.validation-caddy/
 
 # OS / editor noise
 .DS_Store

@@ -15,7 +15,9 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
+ROOT_DIR="$PWD"
 INSTALL_LIB_ONLY=1 . ./install.sh
+. ./deployment-lib.sh
 # Sourcing install.sh applies its `set -euo pipefail` to this shell too. This
 # harness deliberately runs failing commands, so turn -e back off — otherwise
 # the first negative test ends the run and the later checks never report at
@@ -81,11 +83,11 @@ check "keeps unrelated params" \
   "postgresql://u:p@${RDS}:5432/postgres?application_name=erp&sslmode=verify-full&sslrootcert=${CA}" \
   "$(rds_tls_url "postgresql://u:p@${RDS}:5432/postgres?sslmode=require&application_name=erp" "$CA")"
 
-# Non-RDS hosts are left completely alone: a DigitalOcean or Neon URL must
-# not acquire a path to an Amazon CA bundle that does not describe it.
-check "leaves DigitalOcean untouched" \
-  "postgresql://u:p@db.ondigitalocean.com:25060/defaultdb?sslmode=require" \
-  "$(rds_tls_url "postgresql://u:p@db.ondigitalocean.com:25060/defaultdb?sslmode=require" "$CA")"
+# Non-RDS hosts are left completely alone: another provider's URL must not
+# acquire a path to an Amazon CA bundle that does not describe it.
+check "leaves another provider untouched" \
+  "postgresql://u:p@db.provider.example:25060/defaultdb?sslmode=require" \
+  "$(rds_tls_url "postgresql://u:p@db.provider.example:25060/defaultdb?sslmode=require" "$CA")"
 check "leaves Neon untouched" \
   "postgresql://u:p@ep-x.neon.tech/neondb?sslmode=require" \
   "$(rds_tls_url "postgresql://u:p@ep-x.neon.tech/neondb?sslmode=require" "$CA")"
@@ -118,7 +120,9 @@ check "not a pg URL"   "1" "$(is_pgurl 'mysql://h/db'; echo $?)"
 echo
 echo "phase state + run_phase"
 
-STATE_FILE="$(mktemp)"
+TEST_ROOT="${PWD}/.test-install.$$"
+mkdir -p "$TEST_ROOT"
+STATE_FILE="${TEST_ROOT}/install-state"
 : > "$STATE_FILE"
 
 mark_completed 3
@@ -171,7 +175,7 @@ rm -f "$STATE_FILE"
 echo
 echo "load_env_var"
 
-tmpdir="$(mktemp -d)"; pushd "$tmpdir" > /dev/null
+tmpdir="${TEST_ROOT}/sparse-env"; mkdir -p "$tmpdir"; pushd "$tmpdir" > /dev/null
 printf 'APP_URL=https://api.example.test
 IMAGE_TAG=latest
 ' > .env
@@ -198,7 +202,198 @@ unset DOMAIN
 ) > /dev/null 2>&1
 check "a whole load_config pass survives a sparse .env" "0" "$?"
 
-popd > /dev/null; rm -rf "$tmpdir"
+popd > /dev/null
+
+# ----------------------------------------------------------------------
+# Dual-domain migration and Caddy template rendering.
+# ----------------------------------------------------------------------
+echo
+echo "dual-domain configuration"
+
+check "valid API domain" "0" "$(validate_domain 'api.example.test'; echo $?)"
+check "rejects URL as domain" "1" "$(validate_domain 'https://api.example.test'; echo $?)"
+check "fails closed for unsupported IDN A-labels" "1" \
+  "$(validate_domain 'api.xn--p1ai'; echo $?)"
+check "extracts URL host" "app.example.test" "$(domain_from_url 'https://app.example.test/path')"
+check "accepts root frontend and API subdomain" "0" \
+  "$(validate_auth_site_domains 'api.example.test' 'example.test' 'example.test'; echo $?)"
+check "accepts root API and frontend subdomain" "0" \
+  "$(validate_auth_site_domains 'example.test' 'app.example.test' 'example.test'; echo $?)"
+check "rejects suffix lookalike" "1" \
+  "$(validate_auth_site_domains 'api.example.test' 'badexample.test' 'example.test'; echo $?)"
+check "rejects public-suffix cross-sites" "1" \
+  "$(validate_auth_site_domains 'api.foo.blogspot.com' 'app.bar.blogspot.com' 'foo.blogspot.com'; echo $?)"
+check "accepts production registrable domain" "0" \
+  "$(validate_auth_site_domains 'api.salessphere360.tech' 'salessphere360.tech' 'salessphere360.tech'; echo $?)"
+check "rejects ICANN public suffix root" "1" \
+  "$(validate_auth_site_domains 'api.co.uk' 'app.co.uk' 'co.uk'; echo $?)"
+check "rejects PRIVATE public suffix root" "1" \
+  "$(validate_auth_site_domains 'api.blogspot.com' 'app.blogspot.com' 'blogspot.com'; echo $?)"
+check "rejects top-level public suffix" "1" \
+  "$(validate_auth_site_domains 'api.example.com' 'app.example.com' 'com'; echo $?)"
+check "accepts tenant registrable domain under PRIVATE suffix" "0" \
+  "$(validate_auth_site_domains 'api.foo.blogspot.com' 'foo.blogspot.com' 'foo.blogspot.com'; echo $?)"
+check "wildcard rule makes a.ck a public suffix" "a.ck" "$(public_suffix 'a.ck')"
+check "wildcard public suffix cannot be auth site" "1" \
+  "$(validate_auth_site_domains 'api.a.ck' 'app.a.ck' 'a.ck'; echo $?)"
+check "exception rule makes www.ck registrable" "www.ck" "$(registrable_domain 'www.ck')"
+check "exception registrable domain is accepted" "0" \
+  "$(validate_auth_site_domains 'api.www.ck' 'www.ck' 'www.ck'; echo $?)"
+check "rejects a deeper auth boundary than the registrable domain" "1" \
+  "$(validate_auth_site_domains 'api.auth.example.com' 'app.auth.example.com' 'auth.example.com'; echo $?)"
+check "accepts sibling hosts with an explicit parent" "0" \
+  "$(validate_auth_site_domains 'api.example.test' 'app.example.test' 'example.test'; echo $?)"
+check "derives exact frontend parent" "example.test" \
+  "$(derive_auth_site_domain 'api.example.test' 'example.test')"
+check "does not derive from sibling labels" "1" \
+  "$(derive_auth_site_domain 'api.example.test' 'app.example.test' >/dev/null; echo $?)"
+
+rendered="${TEST_ROOT}/Caddyfile"
+render_caddy_template "api.example.test" "example.test" "example.test" \
+  Caddyfile.template "$rendered"
+check "renders API host" "1" "$(grep -c '^api.example.test {' "$rendered")"
+check "renders frontend host" "1" "$(grep -c '^example.test {' "$rendered")"
+check "removes placeholders" "0" "$(grep -c '{{' "$rendered")"
+check "rejects equal hosts" "1" \
+  "$(render_caddy_template 'api.example.test' 'api.example.test' 'api.example.test' Caddyfile.template "${TEST_ROOT}/bad"; echo $?)"
+check "Caddy render rejects invalid auth contract" "1" \
+  "$(render_caddy_template 'api.foo.blogspot.com' 'app.bar.blogspot.com' 'foo.blogspot.com' Caddyfile.template "${TEST_ROOT}/bad"; echo $?)"
+
+saved_psl="$PUBLIC_SUFFIX_LIST"
+PUBLIC_SUFFIX_LIST="${TEST_ROOT}/missing-psl.dat"
+check "missing PSL fails closed" "1" \
+  "$(validate_auth_site_domains 'api.example.test' 'example.test' 'example.test' >/dev/null 2>&1; echo $?)"
+PUBLIC_SUFFIX_LIST="$saved_psl"
+
+legacy="${TEST_ROOT}/legacy"; mkdir -p "$legacy"
+cat > "${legacy}/.env" <<'EOF'
+APP_URL=https://api.legacy.test
+CORS_ORIGIN=https://legacy.test
+JWT_SECRET=keep-me
+JWT_REFRESH_SECRET=keep-me-too
+CSRF_SECRET=keep-csrf
+SUPERADMIN_PASSWORD=keep-admin
+EOF
+old_repo_dir="$REPO_DIR"
+REPO_DIR="$legacy"
+unset API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN DOMAIN JWT_SECRET JWT_REFRESH_SECRET CSRF_SECRET SUPERADMIN_PASSWORD
+load_config
+check "migrates API_DOMAIN from APP_URL" "api.legacy.test" "$API_DOMAIN"
+check "migrates FRONTEND_DOMAIN from CORS_ORIGIN" "legacy.test" "$FRONTEND_DOMAIN"
+check "safely derives AUTH_SITE_DOMAIN from exact parent" "legacy.test" "$AUTH_SITE_DOMAIN"
+check "preserves JWT secret" "keep-me" "$JWT_SECRET"
+check "preserves refresh secret" "keep-me-too" "$JWT_REFRESH_SECRET"
+check "preserves CSRF secret" "keep-csrf" "$CSRF_SECRET"
+check "preserves admin password" "keep-admin" "$SUPERADMIN_PASSWORD"
+
+legacy_siblings="${TEST_ROOT}/legacy-siblings"; mkdir -p "$legacy_siblings"
+cat > "${legacy_siblings}/.env" <<'EOF'
+APP_URL=https://api.legacy.test
+CORS_ORIGIN=https://app.legacy.test
+JWT_SECRET=keep-sibling-secret
+EOF
+REPO_DIR="$legacy_siblings"
+unset API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN DOMAIN JWT_SECRET
+load_config
+check "does not guess auth site from sibling hosts" "" "${AUTH_SITE_DOMAIN:-}"
+check "still preserves secrets when auth site needs input" "keep-sibling-secret" "$JWT_SECRET"
+
+: > "$STATE_FILE"
+for phase in $(seq 1 "$TOTAL_PHASES"); do mark_completed "$phase"; done
+check "--resume returns legacy sibling config to phase 5" "5" "$(resume_start_phase)"
+
+printf 'AUTH_SITE_DOMAIN=legacy.test\n' >> "${legacy_siblings}/.env"
+unset API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN DOMAIN JWT_SECRET
+load_config
+check "accepts explicit auth site for sibling hosts" "0" \
+  "$(validate_auth_site_domains "$API_DOMAIN" "$FRONTEND_DOMAIN" "$AUTH_SITE_DOMAIN"; echo $?)"
+cat >> "${legacy_siblings}/.env" <<'EOF'
+API_DOMAIN=api.legacy.test
+FRONTEND_DOMAIN=app.legacy.test
+EOF
+check "--resume keeps verification behavior after migration" "8" "$(resume_start_phase)"
+
+# Every value already rendered by an older installer must survive the
+# phase-5/6 domain migration. Secrets are deliberately unique so a blank,
+# generated replacement, or accidental log disclosure is easy to detect.
+legacy_all="${TEST_ROOT}/legacy-all"; mkdir -p "$legacy_all"
+cat > "${legacy_all}/.env" <<'EOF'
+IMAGE_TAG=sentinel-backend-tag
+FRONTEND_IMAGE_TAG=sentinel-frontend-tag
+GHCR_IMAGE=registry.example/sentinel-backend
+FRONTEND_GHCR_IMAGE=registry.example/sentinel-frontend
+NODE_ENV=sentinel-production
+PORT=4321
+APP_URL=https://api.preserve.test
+CORS_ORIGIN=https://preserve.test
+MARKETING_URL=https://marketing.preserve.test
+DATABASE_URL=postgresql://sentinel-user:sentinel-db-secret@db.preserve.test:5432/sentinel
+REDIS_URL=redis://sentinel-redis:6380
+JWT_SECRET=sentinel-jwt-secret
+JWT_REFRESH_SECRET=sentinel-refresh-secret
+JWT_ACCESS_EXPIRES_IN=31m
+JWT_REFRESH_EXPIRES_IN=19d
+CSRF_SECRET=sentinel-csrf-secret
+COOKIE_DOMAIN=sentinel-cookie.preserve.test
+CLOUDINARY_CLOUD_NAME=sentinel-cloud-name
+CLOUDINARY_API_KEY=sentinel-cloud-key
+CLOUDINARY_API_SECRET=sentinel-cloud-secret
+CLOUDINARY_UPLOAD_FOLDER=sentinel-upload-folder
+EMAIL_PROVIDER=sentinel-email-provider
+SMTP_HOST=sentinel.smtp.preserve.test
+SMTP_PORT=2525
+SMTP_USER=sentinel-smtp-user
+SMTP_PASS=sentinel-smtp-secret
+SMTP_SECURE=sentinel-secure-setting
+SMTP_FROM=sentinel-from@preserve.test
+SMTP_FROM_NAME=Sentinel Sender
+PASSWORD_RESET_URL=https://sentinel.preserve.test/custom-reset
+EMAIL_VERIFICATION_URL=https://sentinel.preserve.test/custom-verify
+RESEND_API_KEY=sentinel-resend-secret
+SUPERADMIN_EMAIL=sentinel-admin@preserve.test
+SUPERADMIN_PASSWORD=sentinel-admin-secret
+IRD_ENABLED=sentinel-ird-enabled
+IRD_API_BASE=https://sentinel.ird.preserve.test
+IRD_TAXPAYER_PAN=sentinel-taxpayer-pan
+IRD_SOFTWARE_ID=sentinel-software-id
+LOG_LEVEL=sentinel-log-level
+EOF
+cp "${legacy_all}/.env" "${legacy_all}/before.env"
+cp "${ROOT_DIR}/Caddyfile.template" "${legacy_all}/Caddyfile.template"
+
+rendered_keys="$(cut -d= -f1 "${legacy_all}/before.env")"
+for key in $rendered_keys API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN; do
+  unset "$key"
+done
+REPO_DIR="$legacy_all"
+NON_INTERACTIVE=1
+DEPLOY_USER="$(id -un)"
+load_config
+install_caddy_config() { : > "${5:-Caddyfile}"; }
+phase_config > "${legacy_all}/migration.log" 2>&1
+phase_render >> "${legacy_all}/migration.log" 2>&1
+migration_status=$?
+if [ "$migration_status" -ne 0 ]; then
+  sed 's/^/       /' "${legacy_all}/migration.log"
+fi
+check "phase 5/6 legacy migration completes" "0" "$migration_status"
+while IFS='=' read -r key expected; do
+  actual="$(grep -E "^${key}=" "${legacy_all}/.env" | head -n1 | cut -d= -f2-)"
+  check "preserves existing ${key}" "$expected" "$actual"
+done < "${legacy_all}/before.env"
+check "migration adds API_DOMAIN" "api.preserve.test" \
+  "$(grep '^API_DOMAIN=' "${legacy_all}/.env" | cut -d= -f2-)"
+check "migration adds FRONTEND_DOMAIN" "preserve.test" \
+  "$(grep '^FRONTEND_DOMAIN=' "${legacy_all}/.env" | cut -d= -f2-)"
+check "migration adds AUTH_SITE_DOMAIN" "preserve.test" \
+  "$(grep '^AUTH_SITE_DOMAIN=' "${legacy_all}/.env" | cut -d= -f2-)"
+check "migration does not print secret sentinels" "1" \
+  "$(grep -qE 'sentinel-(db|jwt|refresh|csrf|cloud|smtp|resend|admin)-secret' "${legacy_all}/migration.log"; echo $?)"
+
+REPO_DIR="$old_repo_dir"
+cd "$ROOT_DIR"
+
+rm -rf "$TEST_ROOT"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
