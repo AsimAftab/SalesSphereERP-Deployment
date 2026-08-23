@@ -151,7 +151,7 @@ deploy_frontend() {
   docker compose pull frontend
   step "Replacing frontend service"
   docker compose up -d frontend
-  wait_for_health frontend http://localhost:8080/healthz
+  wait_for_health frontend http://127.0.0.1:8080/healthz
 }
 
 case "$TARGET" in

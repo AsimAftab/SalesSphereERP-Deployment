@@ -1023,7 +1023,7 @@ phase_start() {
     if docker compose exec -T app wget -qO- --tries=1 \
          http://localhost:3000/health/ready > /dev/null 2>&1 \
        && docker compose exec -T frontend wget -qO- --tries=1 \
-         http://localhost:8080/healthz > /dev/null 2>&1; then
+         http://127.0.0.1:8080/healthz > /dev/null 2>&1; then
       HEALTH_OK=1
       note "Both services healthy after $((attempt * 3))s"
       break
@@ -1064,7 +1064,7 @@ phase_summary() {
   if docker compose exec -T app wget -qO- --tries=1 \
        http://localhost:3000/health/ready > /dev/null 2>&1 \
      && docker compose exec -T frontend wget -qO- --tries=1 \
-       http://localhost:8080/healthz > /dev/null 2>&1; then
+       http://127.0.0.1:8080/healthz > /dev/null 2>&1; then
     health_live=1
   fi
 

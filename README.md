@@ -149,7 +149,7 @@ docker compose logs -f app
 docker compose logs -f frontend
 docker compose logs -f caddy
 docker compose exec app wget -qO- http://localhost:3000/health/ready
-docker compose exec frontend wget -qO- http://localhost:8080/healthz
+docker compose exec frontend wget -qO- http://127.0.0.1:8080/healthz
 ```
 
 The installer writes `/home/deploy/credentials-summary.txt` with server,
