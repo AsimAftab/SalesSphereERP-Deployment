@@ -161,7 +161,11 @@ case "$TARGET" in
 esac
 
 step "Applying validated Caddy configuration"
-docker compose up -d caddy
+# Both dependencies were health-checked above (or were already running for a
+# single-service deploy). Do not reconcile them here: the other service's
+# immutable tag exists only in its deployment process environment, while
+# `.env` intentionally retains `latest` as the manual default.
+docker compose up -d --no-deps caddy
 if docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile; then
   dim "Caddy reloaded"
 else
