@@ -1,0 +1,42 @@
+name: Validate deployment
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        run: bash -n install.sh deploy.sh update.sh deployment-lib.sh test-install.sh
+
+      - name: Verify vendored Public Suffix List
+        run: |
+          source ./deployment-lib.sh
+          require_public_suffix_list
+
+      - name: Run installer tests
+        run: bash test-install.sh
+
+      - name: Render Caddy template
+        run: |
+          source ./deployment-lib.sh
+          render_caddy_template api.example.test example.test example.test Caddyfile.template Caddyfile
+          ! grep -q '{{' Caddyfile
+
+      - name: Validate Caddy configuration
+        run: |
+          docker run --rm \
+            -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Validate Docker Compose
+        run: |
+          cp .env.example .env
+          docker compose config --quiet

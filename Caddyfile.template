@@ -1,57 +1,43 @@
-# SalesSphere ERP — Caddy config.
-#
-# Caddy auto-provisions a Let's Encrypt cert on first request to the
-# domain below. Make sure:
-#   1. The domain's A record points at the droplet's public IP BEFORE
-#      starting Caddy — otherwise the ACME challenge fails.
-#   2. Ports 80 and 443 are open in the DO firewall (they're open by
-#      default on a fresh droplet).
-#
-# TEMPLATE — install.sh renders this to ./Caddyfile, substituting {{DOMAIN}}.
-# The rendered Caddyfile is gitignored, so the deploy's
-# `git reset --hard origin/main` no longer wipes it.
-#
-# This was previously a committed Caddyfile with the hostname baked in, which
-# install.sh rewrote via `sed s|api.salessphere.com|$DOMAIN|`. Once the real
-# hostname was committed that pattern matched nothing — the script reported
-# "Rendering Caddyfile (domain: X)" and changed nothing, so deploying on any
-# other domain silently kept serving the old one. A placeholder cannot fail
-# that way: unsubstituted, Caddy refuses to start rather than quietly serving
-# the wrong host.
+# Rendered atomically by install.sh and deploy.sh.
 
-{{DOMAIN}} {
-    # Forward everything to the `app` service on the internal docker network.
-    # This catch-all covers the REST API (/api/v1/*), the health checks, AND the
-    # Socket.io live-tracking endpoint (path /realtime, namespace /v1/tracking).
-    #
-    # WebSockets: no special config needed. Caddy's reverse_proxy detects the
-    # `Connection: Upgrade` / `Upgrade: websocket` handshake and proxies it
-    # transparently (unlike nginx, which needs explicit Upgrade headers). Do NOT
-    # add a separate /realtime block or header rewrites — the catch-all already
-    # streams the WebSocket. See backend docs/live-tracking-socket.md.
-    #
-    # NOTE: single `app` instance today, so Socket.io's polling handshake is
-    # fine. If you scale `app` horizontally, either pin transport to websocket
-    # or add sticky sessions (lb_policy + cookie) so the handshake stays on one
-    # backend; the Redis adapter already handles cross-instance broadcasts.
-    reverse_proxy app:3000
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+}
 
-    # Compression — saves bandwidth, costs almost no CPU.
-    encode zstd gzip
+{{API_DOMAIN}} {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+	encode zstd gzip
+	import security_headers
 
-    # Hardening headers. HSTS only after you're sure prod is HTTPS-only;
-    # a misconfigured HSTS header pins browsers to HTTPS for a year.
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        # Caddy adds Server: Caddy by default — strip it.
-        -Server
-    }
+	# Caddy forwards WebSocket upgrade requests automatically, including the
+	# backend Socket.io endpoint.
+	reverse_proxy app:3000
 
-    # JSON access logs to stdout — `docker compose logs caddy` reads them.
-    log {
-        format json
-    }
+	log {
+		output stdout
+		format json
+	}
+}
+
+{{FRONTEND_DOMAIN}} {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+	encode zstd gzip
+	import security_headers
+	reverse_proxy frontend:8080
+
+	log {
+		output stdout
+		format json
+	}
 }

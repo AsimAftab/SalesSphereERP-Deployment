@@ -27,7 +27,9 @@
 #   sudo bash install.sh
 #
 # Values can be pre-set as env vars to skip prompts entirely (CI):
-#   DOMAIN=api.example.com DATABASE_URL=postgresql://... \
+#   API_DOMAIN=api.example.com FRONTEND_DOMAIN=example.com \
+#   AUTH_SITE_DOMAIN=example.com \
+#   DATABASE_URL=postgresql://... \
 #   GHCR_USER=... GHCR_TOKEN=... DEPLOY_SSH_KEY="ssh-ed25519 ..." \
 #   sudo -E bash install.sh -y
 
@@ -41,6 +43,7 @@ DEPLOY_HOME="/home/${DEPLOY_USER}"
 REPO_URL="https://github.com/AsimAftab/SalesSphereERP-Deployment.git"
 REPO_DIR="${DEPLOY_HOME}/SalesSphereERP-Deployment"
 GHCR_IMAGE_DEFAULT="ghcr.io/asimaftab/salessphere-erp-backend"
+FRONTEND_GHCR_IMAGE_DEFAULT="ghcr.io/asimaftab/salessphere-erp-frontend"
 SUMMARY_FILE="${DEPLOY_HOME}/credentials-summary.txt"
 # NOT under $DEPLOY_HOME: that directory does not exist until phase 3, and
 # recording phase 1's completion there crashed the very first run on a fresh
@@ -172,27 +175,57 @@ mark_completed()  {
   phase_completed "$1" || echo "phase-$1" >> "$STATE_FILE"
 }
 
-if [ "$RESUME" -eq 1 ] && [ "${INSTALL_LIB_ONLY:-0}" != "1" ]; then
-  last_done=0
+explicit_domains_configured() {
+  local file="${1:-${REPO_DIR}/.env}"
+  [ -f "$file" ] \
+    && grep -qE '^API_DOMAIN=.+$' "$file" \
+    && grep -qE '^FRONTEND_DOMAIN=.+$' "$file" \
+    && grep -qE '^AUTH_SITE_DOMAIN=.+$' "$file"
+}
+
+resume_start_phase() {
+  local last_done=0 n candidate
   for n in $(seq 1 "$TOTAL_PHASES"); do
     phase_completed "$n" && last_done="$n"
   done
+
   if [ "$last_done" -eq 0 ]; then
-    note "No recorded progress — starting from phase 1."
+    candidate=1
   elif [ "$last_done" -ge "$TOTAL_PHASES" ]; then
+    candidate=8
+  else
+    candidate="$last_done"
+  fi
+
+  # A completed pre-dual-domain installation only has APP_URL/CORS_ORIGIN.
+  # It must revisit configuration and rendering before any phase that expects
+  # the explicit domain keys; otherwise --resume skips directly to preflight
+  # and fails despite having enough legacy data to migrate safely.
+  if [ "$candidate" -gt 5 ] && ! explicit_domains_configured; then
+    candidate=5
+  fi
+  printf '%s' "$candidate"
+}
+
+if [ "$RESUME" -eq 1 ] && [ "${INSTALL_LIB_ONLY:-0}" != "1" ]; then
+  FROM_PHASE="$(resume_start_phase)"
+  if [ "$FROM_PHASE" -eq 1 ]; then
+    note "No recorded progress — starting from phase 1."
+  elif [ "$FROM_PHASE" -eq 5 ] && ! explicit_domains_configured; then
+    note "Legacy .env detected without the complete explicit domain contract."
+    note "Resuming at phase 5 to migrate and render API_DOMAIN, FRONTEND_DOMAIN, and AUTH_SITE_DOMAIN."
+  elif [ "$FROM_PHASE" -eq 8 ]; then
     # Every phase is recorded, so a literal resume would jump to the summary
     # and re-print it without touching anything — which is how a run ends up
     # reporting on a stack it never looked at. Re-run the verifying half
     # instead: preflight, migrations, stack, health. Phases 1-7 are
     # provisioning and a pull; they rarely need repeating.
-    FROM_PHASE=8
     note "All phases already recorded — re-running the checks (phase ${FROM_PHASE} onwards)."
     note "Use --from=1 to redo provisioning as well."
   else
     # Resume AT the last completed phase, not after it. Phases are
     # idempotent, and re-running the one that "passed" is cheap insurance
     # against it having half-finished before something downstream blew up.
-    FROM_PHASE="$last_done"
     note "Resuming at phase ${FROM_PHASE} (phases 1-$((FROM_PHASE - 1)) already completed)."
   fi
 fi
@@ -495,7 +528,7 @@ phase_repo() {
 # ============================================================
 # Config loading — always runs, never a phase
 #
-# Later phases need DOMAIN / IMAGE_TAG / DATABASE_URL even when --from
+# Later phases need domains, image tags and DATABASE_URL even when --from
 # skips the prompt phase, so reading them is separate from asking for them.
 # ============================================================
 ENV_PRELOADED=0
@@ -504,30 +537,34 @@ load_config() {
   [ -f .env ] || return 0
   ENV_PRELOADED=1
 
-  # DOMAIN isn't a literal .env key — recover it from APP_URL=https://<host>.
-  # `|| true` for the same reason as load_env_var: a missing APP_URL is a
-  # thing to prompt for, not a reason to die without saying anything.
-  if [ -z "${DOMAIN:-}" ]; then
-    DOMAIN=$(grep -E '^APP_URL=' .env 2>/dev/null \
-      | head -n1 | sed -E 's|^APP_URL=https?://||' | cut -d/ -f1) || true
+  local key
+  for key in \
+    IMAGE_TAG FRONTEND_IMAGE_TAG GHCR_IMAGE FRONTEND_GHCR_IMAGE \
+    API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN \
+    NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL DATABASE_URL REDIS_URL \
+    JWT_SECRET JWT_REFRESH_SECRET JWT_ACCESS_EXPIRES_IN JWT_REFRESH_EXPIRES_IN \
+    CSRF_SECRET COOKIE_DOMAIN \
+    CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET \
+    CLOUDINARY_UPLOAD_FOLDER \
+    EMAIL_PROVIDER SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_SECURE \
+    SMTP_FROM SMTP_FROM_NAME PASSWORD_RESET_URL EMAIL_VERIFICATION_URL \
+    RESEND_API_KEY SUPERADMIN_EMAIL SUPERADMIN_PASSWORD \
+    IRD_ENABLED IRD_API_BASE IRD_TAXPAYER_PAN IRD_SOFTWARE_ID LOG_LEVEL; do
+    load_env_var "$key"
+  done
+
+  # Migrate legacy installs without changing auth secrets. DOMAIN was an
+  # installer input, while APP_URL and CORS_ORIGIN were persisted in .env.
+  if [ -z "${API_DOMAIN:-}" ]; then
+    API_DOMAIN="${DOMAIN:-}"
+    [ -n "$API_DOMAIN" ] || API_DOMAIN="$(domain_from_url "$(grep -E '^APP_URL=' .env 2>/dev/null | head -n1 | cut -d= -f2- || true)")"
   fi
-  load_env_var CORS_ORIGIN
-  load_env_var SUPERADMIN_EMAIL
-  load_env_var DATABASE_URL
-  load_env_var IMAGE_TAG
-  load_env_var SMTP_HOST
-  load_env_var SMTP_PORT
-  load_env_var SMTP_USER
-  load_env_var SMTP_PASS
-  load_env_var SMTP_FROM
-  load_env_var SMTP_FROM_NAME
-  # Preserving these matters: regenerating them invalidates every active
-  # session and makes the saved credentials summary a lie.
-  load_env_var JWT_SECRET
-  load_env_var JWT_REFRESH_SECRET
-  load_env_var CSRF_SECRET
-  load_env_var SUPERADMIN_PASSWORD
-  load_env_var GHCR_IMAGE
+  if [ -z "${FRONTEND_DOMAIN:-}" ]; then
+    FRONTEND_DOMAIN="$(domain_from_url "$(grep -E '^CORS_ORIGIN=' .env 2>/dev/null | head -n1 | cut -d= -f2- || true)")"
+  fi
+  if [ -z "${AUTH_SITE_DOMAIN:-}" ]; then
+    AUTH_SITE_DOMAIN="$(derive_auth_site_domain "${API_DOMAIN:-}" "${FRONTEND_DOMAIN:-}" || true)"
+  fi
 }
 
 # ============================================================
@@ -542,11 +579,34 @@ phase_config() {
   fi
   echo
 
-  prompt DOMAIN "Production domain (e.g. api.example.com)"
-  [ -n "${DOMAIN:-}" ] || fail "DOMAIN is required"
+  # Accept the legacy bootstrap contract as well as values already persisted
+  # in .env. This migration only maps host names; generated secrets stay
+  # loaded and are never rotated merely because the domain keys changed.
+  if [ -z "${API_DOMAIN:-}" ]; then
+    API_DOMAIN="${DOMAIN:-}"
+    [ -n "$API_DOMAIN" ] || API_DOMAIN="$(domain_from_url "${APP_URL:-}")"
+  fi
+  if [ -z "${FRONTEND_DOMAIN:-}" ]; then
+    FRONTEND_DOMAIN="$(domain_from_url "${CORS_ORIGIN:-}")"
+  fi
 
-  prompt CORS_ORIGIN "Frontend origin (CORS allowed)" "https://app.${DOMAIN#api.}"
-  prompt SUPERADMIN_EMAIL "Platform super-admin email" "admin@${DOMAIN#api.}"
+  prompt API_DOMAIN "API domain (e.g. api.example.com)"
+  prompt FRONTEND_DOMAIN "Frontend domain (e.g. example.com)" "${API_DOMAIN#api.}"
+  if [ -z "${AUTH_SITE_DOMAIN:-}" ]; then
+    AUTH_SITE_DOMAIN="$(derive_auth_site_domain "$API_DOMAIN" "$FRONTEND_DOMAIN" || true)"
+  fi
+  prompt AUTH_SITE_DOMAIN "Shared auth site parent domain"
+  validate_domain "$API_DOMAIN" || fail "API_DOMAIN is invalid: $API_DOMAIN"
+  validate_domain "$FRONTEND_DOMAIN" || fail "FRONTEND_DOMAIN is invalid: $FRONTEND_DOMAIN"
+  validate_domain "$AUTH_SITE_DOMAIN" || fail "AUTH_SITE_DOMAIN is required and invalid: ${AUTH_SITE_DOMAIN:-<empty>}"
+  validate_auth_site_domains "$API_DOMAIN" "$FRONTEND_DOMAIN" "$AUTH_SITE_DOMAIN" \
+    || fail "API_DOMAIN and FRONTEND_DOMAIN must be different and each must equal
+       AUTH_SITE_DOMAIN or be its proper subdomain. Lookalike suffixes and hosts
+       outside the explicitly configured auth site are rejected."
+
+  : "${CORS_ORIGIN:=https://${FRONTEND_DOMAIN}}"
+  prompt MARKETING_URL "Marketing site URL" "https://${FRONTEND_DOMAIN#app.}"
+  prompt SUPERADMIN_EMAIL "Platform super-admin email" "admin@${API_DOMAIN#api.}"
   is_email "$SUPERADMIN_EMAIL" || fail "Invalid email: $SUPERADMIN_EMAIL"
 
   prompt_secret DATABASE_URL "DATABASE_URL (managed Postgres connection string)"
@@ -562,6 +622,8 @@ phase_config() {
 
   prompt GHCR_IMAGE "GHCR image (no tag)" "$GHCR_IMAGE_DEFAULT"
   prompt IMAGE_TAG "Image tag to deploy" "latest"
+  prompt FRONTEND_GHCR_IMAGE "Frontend GHCR image (no tag)" "$FRONTEND_GHCR_IMAGE_DEFAULT"
+  prompt FRONTEND_IMAGE_TAG "Frontend image tag to deploy" "latest"
 
   echo
   note "SMTP — leave blank to skip (configurable later in .env)."
@@ -569,7 +631,7 @@ phase_config() {
   prompt SMTP_PORT "SMTP port" "465"
   prompt SMTP_USER "SMTP username" ""
   prompt_secret SMTP_PASS "SMTP password (or app-specific password)"
-  prompt SMTP_FROM "SMTP from address" "no-reply@${DOMAIN#api.}"
+  prompt SMTP_FROM "SMTP from address" "no-reply@${API_DOMAIN#api.}"
   prompt SMTP_FROM_NAME "SMTP from name" "SalesSphere"
 }
 
@@ -600,12 +662,37 @@ phase_render() {
   # cannot abort the write. Belt to the braces of prompt_secret always
   # defining its variable.
   local v
-  for v in IMAGE_TAG GHCR_IMAGE CORS_ORIGIN SMTP_HOST SMTP_PORT SMTP_USER \
-           SMTP_PASS SMTP_FROM SMTP_FROM_NAME; do
+  for v in IMAGE_TAG FRONTEND_IMAGE_TAG GHCR_IMAGE FRONTEND_GHCR_IMAGE \
+           NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL REDIS_URL \
+           JWT_ACCESS_EXPIRES_IN JWT_REFRESH_EXPIRES_IN COOKIE_DOMAIN \
+           CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET \
+           CLOUDINARY_UPLOAD_FOLDER EMAIL_PROVIDER SMTP_HOST SMTP_PORT \
+           SMTP_USER SMTP_PASS SMTP_SECURE SMTP_FROM SMTP_FROM_NAME \
+           PASSWORD_RESET_URL EMAIL_VERIFICATION_URL RESEND_API_KEY \
+           IRD_ENABLED IRD_API_BASE IRD_TAXPAYER_PAN IRD_SOFTWARE_ID LOG_LEVEL; do
     printf -v "$v" '%s' "${!v:-}"
   done
   : "${IMAGE_TAG:=latest}"
+  : "${FRONTEND_IMAGE_TAG:=latest}"
   : "${GHCR_IMAGE:=$GHCR_IMAGE_DEFAULT}"
+  : "${FRONTEND_GHCR_IMAGE:=$FRONTEND_GHCR_IMAGE_DEFAULT}"
+  : "${NODE_ENV:=production}"
+  : "${PORT:=3000}"
+  : "${APP_URL:=https://${API_DOMAIN}}"
+  : "${CORS_ORIGIN:=https://${FRONTEND_DOMAIN}}"
+  : "${REDIS_URL:=redis://redis:6379}"
+  : "${JWT_ACCESS_EXPIRES_IN:=15m}"
+  : "${JWT_REFRESH_EXPIRES_IN:=7d}"
+  : "${COOKIE_DOMAIN:=${API_DOMAIN}}"
+  : "${CLOUDINARY_UPLOAD_FOLDER:=salessphere-prod}"
+  : "${EMAIL_PROVIDER:=smtp}"
+  if [ -z "$SMTP_SECURE" ]; then
+    [ "$SMTP_PORT" = "465" ] && SMTP_SECURE=true || SMTP_SECURE=false
+  fi
+  : "${PASSWORD_RESET_URL:=https://${FRONTEND_DOMAIN}/auth/reset-password}"
+  : "${EMAIL_VERIFICATION_URL:=https://${FRONTEND_DOMAIN}/auth/verify-email}"
+  : "${IRD_ENABLED:=false}"
+  : "${LOG_LEVEL:=info}"
 
   step "Rendering .env"
   # Written to a temp file and moved into place: `cat > .env` truncates
@@ -618,83 +705,88 @@ phase_render() {
 # Generated by install.sh on $(date -Iseconds)
 # Hand edits survive until the next run, which backs this up to .env.bak.<ts>.
 
-# --- Image ---
+# --- Images ---
 IMAGE_TAG=${IMAGE_TAG}
+FRONTEND_IMAGE_TAG=${FRONTEND_IMAGE_TAG}
 GHCR_IMAGE=${GHCR_IMAGE}
+FRONTEND_GHCR_IMAGE=${FRONTEND_GHCR_IMAGE}
+
+# --- Public hosts ---
+API_DOMAIN=${API_DOMAIN}
+FRONTEND_DOMAIN=${FRONTEND_DOMAIN}
+AUTH_SITE_DOMAIN=${AUTH_SITE_DOMAIN}
 
 # --- Server ---
-NODE_ENV=production
-PORT=3000
-APP_URL=https://${DOMAIN}
+NODE_ENV=${NODE_ENV}
+PORT=${PORT}
+APP_URL=${APP_URL}
 CORS_ORIGIN=${CORS_ORIGIN}
+MARKETING_URL=${MARKETING_URL}
 
 # --- Database ---
 DATABASE_URL=${DATABASE_URL}
 
 # --- Redis (internal docker network) ---
-REDIS_URL=redis://redis:6379
+REDIS_URL=${REDIS_URL}
 
 # --- Auth ---
 JWT_SECRET=${JWT_SECRET}
 JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
-JWT_ACCESS_EXPIRES_IN=15m
-JWT_REFRESH_EXPIRES_IN=7d
+JWT_ACCESS_EXPIRES_IN=${JWT_ACCESS_EXPIRES_IN}
+JWT_REFRESH_EXPIRES_IN=${JWT_REFRESH_EXPIRES_IN}
 CSRF_SECRET=${CSRF_SECRET}
-COOKIE_DOMAIN=${DOMAIN}
+COOKIE_DOMAIN=${COOKIE_DOMAIN}
 
-# --- File storage (Cloudinary) — fill in after setup ---
-CLOUDINARY_CLOUD_NAME=
-CLOUDINARY_API_KEY=
-CLOUDINARY_API_SECRET=
-CLOUDINARY_UPLOAD_FOLDER=salessphere-prod
+# --- File storage (Cloudinary) ---
+CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+CLOUDINARY_UPLOAD_FOLDER=${CLOUDINARY_UPLOAD_FOLDER}
 
 # --- Email ---
-EMAIL_PROVIDER=smtp
+EMAIL_PROVIDER=${EMAIL_PROVIDER}
 SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
 SMTP_USER=${SMTP_USER}
 SMTP_PASS=${SMTP_PASS}
-SMTP_SECURE=$([ "${SMTP_PORT}" = "465" ] && echo true || echo false)
+SMTP_SECURE=${SMTP_SECURE}
 SMTP_FROM=${SMTP_FROM}
 SMTP_FROM_NAME=${SMTP_FROM_NAME}
-PASSWORD_RESET_URL=${CORS_ORIGIN}/auth/reset-password
-EMAIL_VERIFICATION_URL=${CORS_ORIGIN}/auth/verify-email
-RESEND_API_KEY=
+PASSWORD_RESET_URL=${PASSWORD_RESET_URL}
+EMAIL_VERIFICATION_URL=${EMAIL_VERIFICATION_URL}
+RESEND_API_KEY=${RESEND_API_KEY}
 
 # --- Platform super-admin ---
 SUPERADMIN_EMAIL=${SUPERADMIN_EMAIL}
 SUPERADMIN_PASSWORD=${SUPERADMIN_PASSWORD}
 
-# --- IRD (Nepal) — fill in once registered ---
-IRD_ENABLED=false
-IRD_API_BASE=
-IRD_TAXPAYER_PAN=
-IRD_SOFTWARE_ID=
+# --- IRD (Nepal) ---
+IRD_ENABLED=${IRD_ENABLED}
+IRD_API_BASE=${IRD_API_BASE}
+IRD_TAXPAYER_PAN=${IRD_TAXPAYER_PAN}
+IRD_SOFTWARE_ID=${IRD_SOFTWARE_ID}
 
 # --- Logging ---
-LOG_LEVEL=info
+LOG_LEVEL=${LOG_LEVEL}
 EOF
   umask 022
   # Sanity-check before it replaces a working file: a .env that lost
   # DATABASE_URL is worse than no .env at all, because the stack starts and
   # then fails in a way that looks like a database problem.
   grep -q '^DATABASE_URL=' "$env_tmp" && grep -q '^JWT_SECRET=' "$env_tmp" \
+    && grep -q '^AUTH_SITE_DOMAIN=.' "$env_tmp" \
     || { rm -f "$env_tmp"; fail "Rendered .env is incomplete — refusing to install it."; }
   mv "$env_tmp" .env
   chmod 600 .env
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" .env
+  chown "$DEPLOY_USER" .env
 
-  step "Rendering Caddyfile (domain: $DOMAIN)"
+  step "Rendering and validating Caddyfile"
   [ -f Caddyfile.template ] \
     || fail "Caddyfile.template is missing — the deployment repo checkout is incomplete."
   [ -f Caddyfile ] && cp Caddyfile "Caddyfile.bak.$(date +%Y%m%d-%H%M%S)"
-  sed "s|{{DOMAIN}}|${DOMAIN}|g" Caddyfile.template > Caddyfile
-  # Belt and braces: an unsubstituted placeholder would make Caddy fail to
-  # start with a parse error that says nothing about the real cause.
-  if grep -q '{{DOMAIN}}' Caddyfile; then
-    fail "Caddyfile still contains {{DOMAIN}} after rendering — check Caddyfile.template."
-  fi
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" Caddyfile
+  install_caddy_config "$API_DOMAIN" "$FRONTEND_DOMAIN" "$AUTH_SITE_DOMAIN" \
+    || fail "Caddyfile render or validation failed; the previous config was preserved."
+  chown "$DEPLOY_USER" Caddyfile
 }
 
 # ============================================================
@@ -702,17 +794,19 @@ EOF
 # ============================================================
 phase_image() {
   cd "$REPO_DIR"
-  local image="${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}"
+  local backend_image="${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}"
+  local frontend_image="${FRONTEND_GHCR_IMAGE:-$FRONTEND_GHCR_IMAGE_DEFAULT}:${FRONTEND_IMAGE_TAG}"
 
   # No token: fine, as long as the image is already here. Re-running after a
   # failure is the common case, and the image rarely changed in between.
   if [ -z "${GHCR_TOKEN:-}" ]; then
-    if docker image inspect "$image" > /dev/null 2>&1; then
-      issue "No GHCR_TOKEN given — using the ${IMAGE_TAG} image already on this host, which may be stale.
+    if docker image inspect "$backend_image" > /dev/null 2>&1 \
+       && docker image inspect "$frontend_image" > /dev/null 2>&1; then
+      issue "No GHCR_TOKEN given — using both images already on this host, which may be stale.
        To pull a newer build:  sudo GHCR_TOKEN=ghp_xxx bash $0 --resume -y"
       return 0
     fi
-    fail "GHCR_TOKEN is required: ${image} is not on this host, so it has to be pulled.
+    fail "GHCR_TOKEN is required: one or both production images are not on this host.
        Supply it for this run (sudo passes VAR=value through):
          sudo GHCR_TOKEN=ghp_xxx bash $0 --resume -y
        Generate one at https://github.com/settings/tokens (classic, read:packages)."
@@ -735,16 +829,17 @@ phase_image() {
   chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${DEPLOY_HOME}/.docker"
   chmod 600 "${DEPLOY_HOME}/.docker/config.json"
 
-  step "Pulling ${image}"
-  IMAGE_TAG="$IMAGE_TAG" docker compose pull
+  step "Pulling backend and frontend images"
+  IMAGE_TAG="$IMAGE_TAG" FRONTEND_IMAGE_TAG="$FRONTEND_IMAGE_TAG" \
+    docker compose pull app frontend
 
   # Which build is actually running. `latest` is a moving target, and
   # "deployed successfully" against a stale image is a confusing hour.
   local digest built
   digest=$(docker image inspect --format '{{index .RepoDigests 0}}' \
-    "$image" 2>/dev/null || echo '')
+    "$backend_image" 2>/dev/null || echo '')
   built=$(docker image inspect --format '{{.Created}}' \
-    "$image" 2>/dev/null || echo '')
+    "$backend_image" 2>/dev/null || echo '')
   [ -n "$digest" ] && dim "Digest: ${digest##*@}"
   [ -n "$built" ] && dim "Built:  ${built}"
   # Explicit, and not decoration: a function ending in a conditional returns
@@ -785,15 +880,18 @@ phase_preflight() {
   done
 
   # --- DNS ---
-  DROPLET_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo 'unknown')"
-  DNS_IP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1 || echo '')"
-  if [ -z "$DNS_IP" ]; then
-    issue "$DOMAIN does not resolve. Caddy cannot obtain a certificate until an A record points at ${DROPLET_IP}."
-  elif [ "$DNS_IP" != "$DROPLET_IP" ]; then
-    issue "$DOMAIN resolves to ${DNS_IP}, but this host is ${DROPLET_IP}. Caddy cannot obtain a certificate until the A record is updated."
-  else
-    step "DNS: $DOMAIN → $DROPLET_IP"
-  fi
+  SERVER_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo 'unknown')"
+  local domain dns_ip
+  for domain in "$API_DOMAIN" "$FRONTEND_DOMAIN"; do
+    dns_ip="$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -n1 || echo '')"
+    if [ -z "$dns_ip" ]; then
+      issue "$domain does not resolve. Caddy cannot obtain a certificate until its DNS record points at ${SERVER_IP}."
+    elif [ "$dns_ip" != "$SERVER_IP" ]; then
+      issue "$domain resolves to ${dns_ip}, but this server is ${SERVER_IP}. Update DNS before TLS provisioning."
+    else
+      step "DNS: $domain → $SERVER_IP"
+    fi
+  done
 
   # --- Database TCP reachability ---
   local db_host db_port
@@ -805,8 +903,8 @@ phase_preflight() {
   else
     DB_REACHABLE=0
     issue "Cannot open a TCP connection to ${db_host}:${db_port}.
-       Usually the database firewall (AWS security group / DO trusted sources)
-       does not allow this host's IP: ${DROPLET_IP}"
+       Usually the database network allowlist does not include this server's
+       public IP: ${SERVER_IP}"
   fi
 
   # --- Does the image carry the database CA bundle? ---
@@ -832,7 +930,7 @@ phase_preflight() {
       # Phase 6 rendered .env with the un-normalised URL. Written with a
       # literal-safe replacement: a connection string routinely contains &,
       # / and other characters sed would otherwise interpret.
-      local tmp; tmp="$(mktemp)"
+      local tmp; tmp="$(mktemp "${PWD}/.env.db.tmp.XXXXXX")"
       grep -v '^DATABASE_URL=' .env > "$tmp"
       printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$tmp"
       cat "$tmp" > .env && rm -f "$tmp"
@@ -916,29 +1014,32 @@ phase_migrate() {
 HEALTH_OK=0
 phase_start() {
   cd "$REPO_DIR"
-  IMAGE_TAG="$IMAGE_TAG" docker compose up -d
+  IMAGE_TAG="$IMAGE_TAG" FRONTEND_IMAGE_TAG="$FRONTEND_IMAGE_TAG" docker compose up -d
 
-  # 60s: a cold start pulls a fiscal year, warms Prisma and connects Redis.
-  # The old 30s window reported failure on a server that was merely slow.
-  step "Waiting for /health/ready (up to 60s)"
+  step "Waiting for backend /health/ready and frontend /healthz (up to 60s)"
   local attempt
   for attempt in $(seq 1 20); do
     sleep 3
-    if curl -fsS --max-time 5 http://localhost:3000/health/ready > /dev/null 2>&1; then
+    if docker compose exec -T app wget -qO- --tries=1 \
+         http://localhost:3000/health/ready > /dev/null 2>&1 \
+       && docker compose exec -T frontend wget -qO- --tries=1 \
+         http://localhost:8080/healthz > /dev/null 2>&1; then
       HEALTH_OK=1
-      note "Healthy after $((attempt * 3))s"
+      note "Both services healthy after $((attempt * 3))s"
       break
     fi
     [ $((attempt % 5)) -eq 0 ] && dim "still waiting (${attempt}/20)…"
   done
 
   if [ "$HEALTH_OK" -ne 1 ]; then
-    issue "Health check never went green."
+    issue "One or both service health checks never went green."
     # Show the logs instead of telling the operator to go find them —
     # the cause is almost always in the last few lines.
     echo
     warn "Last 40 lines of the app log:"
     docker compose logs app --tail=40 2>&1 | sed 's/^/      /' || true
+    warn "Last 40 lines of the frontend log:"
+    docker compose logs frontend --tail=40 2>&1 | sed 's/^/      /' || true
     echo
     return 1
   fi
@@ -953,19 +1054,24 @@ phase_summary() {
 
   # A skipped phase leaves its variables unset, so anything asserted from
   # them would be invented. Re-establish the facts that are cheap to check.
-  if [ -z "${DROPLET_IP:-}" ] || [ "$DROPLET_IP" = "unknown" ]; then
-    DROPLET_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo 'unknown')"
+  if [ -z "${SERVER_IP:-}" ] || [ "$SERVER_IP" = "unknown" ]; then
+    SERVER_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo 'unknown')"
   fi
 
   # The live answer beats whatever this process happened to observe: on a
   # --resume the stack has usually been running for a while already.
   local health_live=0
-  curl -fsS --max-time 5 http://localhost:3000/health/ready > /dev/null 2>&1 && health_live=1
+  if docker compose exec -T app wget -qO- --tries=1 \
+       http://localhost:3000/health/ready > /dev/null 2>&1 \
+     && docker compose exec -T frontend wget -qO- --tries=1 \
+       http://localhost:8080/healthz > /dev/null 2>&1; then
+    health_live=1
+  fi
 
   local seed_block
   case "$SEED_STATE" in
     ok)
-      seed_block="  URL:       https://${DOMAIN}/api/v1/auth/login
+      seed_block="  URL:       https://${API_DOMAIN}/api/v1/auth/login
   Email:     ${SUPERADMIN_EMAIL}
   Password:  ${SUPERADMIN_PASSWORD}
 
@@ -1000,7 +1106,7 @@ phase_summary() {
     HEALTH_OK=1
   else
     HEALTH_OK=0
-    issue "http://localhost:3000/health/ready is not responding right now."
+    issue "The backend and frontend internal health checks are not both responding."
   fi
 
   local issues_block="  None."
@@ -1015,8 +1121,12 @@ phase_summary() {
   cat > "$SUMMARY_FILE" <<EOF
 SalesSphere ERP — server setup summary
 Generated: $(date -Iseconds)
-Host IP:   ${DROPLET_IP:-unknown}
-Image:     ${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}
+Server IP: ${SERVER_IP:-unknown}
+Backend:   ${GHCR_IMAGE:-$GHCR_IMAGE_DEFAULT}:${IMAGE_TAG}
+Frontend:  ${FRONTEND_GHCR_IMAGE:-$FRONTEND_GHCR_IMAGE_DEFAULT}:${FRONTEND_IMAGE_TAG}
+API host:  ${API_DOMAIN}
+Web host:  ${FRONTEND_DOMAIN}
+Auth site: ${AUTH_SITE_DOMAIN}
 
 ═════════════════════════════════════════════════════════════════
   Platform super-admin
@@ -1031,16 +1141,15 @@ ${seed_block}
 ${issues_block}
 
 ═════════════════════════════════════════════════════════════════
-  GitHub secrets for the BACKEND repo
+  Shared GitHub secrets for the BACKEND and FRONTEND repos
   (Settings → Secrets and variables → Actions → New)
 ═════════════════════════════════════════════════════════════════
 
-  DROPLET_HOST       ${DROPLET_IP:-unknown}
-  DROPLET_USER       ${DEPLOY_USER}
-  DROPLET_SSH_KEY    <the PRIVATE half of the deploy SSH key pair>
-  DROPLET_SSH_PORT   22  (only if non-standard)
+  SERVER_HOST        ${SERVER_IP:-unknown}
+  SERVER_USER        ${DEPLOY_USER}
+  SERVER_SSH_KEY     <the PRIVATE half of the deploy SSH key pair>
+  SERVER_SSH_PORT    22
   DEPLOYMENT_DIR     ${REPO_DIR}
-  HEALTH_URL         https://${DOMAIN}/health/ready
 
   Plus: create a 'production' GitHub Environment
     (Settings → Environments → New environment).
@@ -1049,23 +1158,24 @@ ${issues_block}
   Health check
 ═════════════════════════════════════════════════════════════════
 
-  Local:   http://localhost:3000/health/ready
-  Public:  https://${DOMAIN}/health/ready  (after DNS + first cert)
+  Backend: https://${API_DOMAIN}/health/ready
+  Frontend: https://${FRONTEND_DOMAIN}/healthz
 
 ═════════════════════════════════════════════════════════════════
   Day-to-day
 ═════════════════════════════════════════════════════════════════
 
   Tail logs:         docker compose logs -f app
-  Manual deploy:     cd ${REPO_DIR} && ./update.sh
-  Rollback:          cd ${REPO_DIR} && ./update.sh sha-<previous-sha>
+  Backend deploy:    cd ${REPO_DIR} && ./deploy.sh backend [sha-tag]
+  Frontend deploy:   cd ${REPO_DIR} && ./deploy.sh frontend [sha-tag]
+  Deploy both:       cd ${REPO_DIR} && ./deploy.sh all [sha-tag]
   One-off command:   docker compose run --rm app <command>
   Re-run setup:      sudo bash install.sh --resume -y
   Install log:       ${LOG_FILE}
 
 This summary is saved at: ${SUMMARY_FILE}
 EOF
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$SUMMARY_FILE"
+  chown "$DEPLOY_USER" "$SUMMARY_FILE"
   chmod 600 "$SUMMARY_FILE"
   cat "$SUMMARY_FILE"
 }
@@ -1085,6 +1195,12 @@ run_phase 2  "Firewall (UFW)"       phase_firewall
 run_phase 3  "Deploy user"          phase_deploy_user
 run_phase 4  "Deployment repo"      phase_repo
 
+[ -r "$REPO_DIR/deployment-lib.sh" ] \
+  || fail "deployment-lib.sh is missing or unreadable — the deployment checkout is incomplete."
+. "$REPO_DIR/deployment-lib.sh"
+require_public_suffix_list \
+  || fail "The vendored Public Suffix List is unavailable. Re-run phase 4 to restore the complete deployment checkout."
+
 # Config is loaded outside the phase system so --from=9 still knows the
 # domain, image tag and database URL.
 load_config
@@ -1095,14 +1211,20 @@ load_config
 # the thing the operator actually has to fix.
 if [ "$FROM_PHASE" -gt 5 ]; then
   : "${IMAGE_TAG:=latest}"
+  : "${FRONTEND_IMAGE_TAG:=latest}"
   : "${GHCR_USER:=AsimAftab}"
   : "${GHCR_IMAGE:=$GHCR_IMAGE_DEFAULT}"
-  for required in DOMAIN DATABASE_URL; do
+  : "${FRONTEND_GHCR_IMAGE:=$FRONTEND_GHCR_IMAGE_DEFAULT}"
+  for required in API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN DATABASE_URL; do
     [ -n "${!required:-}" ] || fail "Starting at phase ${FROM_PHASE} requires ${required}, and it is not
        set in ${REPO_DIR}/.env or the environment.
        Run the configuration phase too:
          sudo bash $0 --from=5 -y"
   done
+  validate_auth_site_domains "$API_DOMAIN" "$FRONTEND_DOMAIN" "$AUTH_SITE_DOMAIN" \
+    || fail "The saved API_DOMAIN, FRONTEND_DOMAIN, and AUTH_SITE_DOMAIN do not
+       satisfy the shared auth-site contract. Re-run configuration:
+         sudo bash $0 --from=5"
 fi
 
 run_phase 5  "Configuration"        phase_config
