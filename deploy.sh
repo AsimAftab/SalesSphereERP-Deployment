@@ -136,7 +136,50 @@ wait_for_health() {
   return 1
 }
 
+# Refuse to start a pull that cannot finish. containerd extracts layers
+# straight onto /, and running out of space mid-extract leaves a partially
+# written snapshot behind — so a nearly-full disk becomes a completely full
+# one that the next attempt inherits. Failing here costs nothing; failing
+# halfway through costs the next three deploys too.
+MIN_FREE_MB="${DEPLOY_MIN_FREE_MB:-5120}"
+
+require_disk_space() {
+  local avail_mb
+  avail_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+  if [ -z "$avail_mb" ]; then
+    warn "Could not read free space on / — continuing without the check."
+    return 0
+  fi
+  if [ "$avail_mb" -lt "$MIN_FREE_MB" ]; then
+    fail "Only ${avail_mb}MB free on / — need ${MIN_FREE_MB}MB to pull an image safely.
+       Reclaim space, then redeploy:
+         docker image prune -af --filter 'until=168h'
+         docker system df && df -h /
+       Do NOT prune volumes: caddy-data holds the TLS certificates."
+  fi
+  dim "Disk: ${avail_mb}MB free on /"
+}
+
+# Every merge to main publishes a new immutable sha- tag and this host only
+# ever pulls, so without this images accumulate until / fills. Runs only
+# after a successful rollout, so a failed deploy keeps the previous image
+# for the rollback that rollback_guidance() prints.
+#
+# Age-filtered rather than a bare -a: a recent previous image stays local so
+# rolling back does not re-download it. An image older than the retention
+# window is still pruned, so a rollback across a quiet period re-pulls —
+# slower, but never broken. Images backing a running container are never
+# touched by prune.
+prune_old_images() {
+  local keep_hours="${DEPLOY_IMAGE_RETENTION_HOURS:-168}"
+  step "Pruning images unused for more than ${keep_hours}h"
+  docker image prune -af --filter "until=${keep_hours}h" 2>&1 \
+    | tail -n 1 | sed 's/^/    /' || true
+  dim "$(df -Pm / | awk 'NR==2{print $4}')MB free on / after prune"
+}
+
 deploy_backend() {
+  require_disk_space
   step "Pulling backend image"
   docker compose pull app
   step "Applying backend migrations before replacement"
@@ -147,6 +190,7 @@ deploy_backend() {
 }
 
 deploy_frontend() {
+  require_disk_space
   step "Pulling frontend image"
   docker compose pull frontend
   step "Replacing frontend service"
@@ -179,4 +223,5 @@ else
 fi
 
 trap - ERR
+prune_old_images
 step "Deployment complete: ${TARGET}"

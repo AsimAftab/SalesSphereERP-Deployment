@@ -417,6 +417,56 @@ rds_tls_url() {
 }
 
 # ============================================================
+# Docker daemon logging
+# ============================================================
+# Docker's default json-file driver has NO size limit. Caddy writes one JSON
+# line per request for both domains, so on a long-lived host container logs
+# grow without bound on the same disk that image pulls need — the failure
+# this guards against filled / completely in Sep 2026.
+#
+# Merge rather than overwrite: daemon.json may already carry unrelated
+# settings, and silently replacing them would be worse than doing nothing.
+DOCKER_DAEMON_JSON=/etc/docker/daemon.json
+
+configure_docker_logging() {
+  local desired current merged
+  desired='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+
+  install -m 0755 -d /etc/docker
+  if [ -s "$DOCKER_DAEMON_JSON" ]; then
+    current="$(cat "$DOCKER_DAEMON_JSON")"
+  else
+    current='{}'
+  fi
+
+  # `*` is jq's recursive object merge, so unrelated keys survive.
+  if ! merged="$(printf '%s' "$current" | jq -S --argjson add "$desired" '. * $add' 2>/dev/null)"; then
+    issue "${DOCKER_DAEMON_JSON} is not valid JSON — left untouched. Add log rotation by hand."
+    return 0
+  fi
+
+  if [ "$(printf '%s' "$current" | jq -S . 2>/dev/null)" = "$merged" ]; then
+    step "Docker log rotation already configured"
+    return 0
+  fi
+
+  printf '%s\n' "$merged" > "$DOCKER_DAEMON_JSON"
+  chmod 644 "$DOCKER_DAEMON_JSON"
+  step "Docker log rotation configured (max-size 10m, max-file 3)"
+
+  # Restarting the daemon bounces every running container. On a fresh install
+  # there are none; on a re-run against a live host that is an outage the
+  # operator did not ask for, so hand it to them instead.
+  if [ -n "$(docker ps -q 2>/dev/null)" ]; then
+    issue "Log rotation written but NOT active — containers are running and restarting
+       Docker would interrupt them. Apply in a maintenance window: systemctl restart docker"
+  elif systemctl is-active --quiet docker 2>/dev/null; then
+    systemctl restart docker
+    note "Docker restarted; log rotation active."
+  fi
+}
+
+# ============================================================
 # Phase 1 — system packages
 # ============================================================
 phase_packages() {
@@ -454,6 +504,8 @@ https://download.docker.com/linux/ubuntu ${codename} stable" \
   docker compose version > /dev/null 2>&1 \
     || fail "The Docker Compose plugin is missing. Install it with:
        apt-get install -y docker-compose-plugin"
+
+  configure_docker_logging
 }
 
 # ============================================================
