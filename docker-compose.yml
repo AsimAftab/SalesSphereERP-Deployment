@@ -11,7 +11,7 @@ services:
       REDIS_URL: redis://redis:6379
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
     networks:
       - internal
     healthcheck:
@@ -42,7 +42,24 @@ services:
       - internal
     volumes:
       - redis-data:/data
-    command: ["redis-server", "--appendonly", "yes"]
+    # maxmemory bounds what Redis can grow into; the AOF on redis-data is
+    # otherwise unbounded on the same disk the image pulls need.
+    # noeviction is deliberate — BullMQ job state must never be silently
+    # evicted, so Redis refuses writes loudly instead of losing jobs.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   caddy:
     image: caddy:2-alpine
