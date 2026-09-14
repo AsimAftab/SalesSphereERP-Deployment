@@ -89,6 +89,14 @@ fi
 PREVIOUS_BACKEND="$(docker inspect --format '{{.Config.Image}}' salessphere-app 2>/dev/null || true)"
 PREVIOUS_FRONTEND="$(docker inspect --format '{{.Config.Image}}' salessphere-frontend 2>/dev/null || true)"
 
+# Whether this run actually swapped a container, and whether it moved the
+# schema. on_failure reads both: a failure before `up -d` leaves the old
+# container serving and must not be "rolled back", and a failure after a
+# migration must not be rolled back automatically at all.
+BACKEND_REPLACED=0
+FRONTEND_REPLACED=0
+BACKEND_MIGRATED=0
+
 rollback_guidance() {
   local service="$1" image="$2"
   [ -n "$image" ] || return 0
@@ -101,18 +109,70 @@ rollback_guidance() {
   fi
 }
 
+# Put the previous image back. Only ever called for a service this run
+# actually replaced. Best-effort by design: every failure here still falls
+# through to rollback_guidance, because the one thing worse than not rolling
+# back is reporting that we did when we did not.
+rollback_service() {
+  local service="$1" compose_svc="$2" image="$3" url="$4"
+  local tag="${image##*:}" var
+
+  if [ -z "$image" ] || [ "$tag" = "$image" ]; then
+    warn "No previous ${service} image tag recorded — cannot roll back automatically."
+    rollback_guidance "$service" "$image"
+    return 0
+  fi
+
+  case "$service" in
+    backend) var=IMAGE_TAG ;;
+    frontend) var=FRONTEND_IMAGE_TAG ;;
+    *) return 0 ;;
+  esac
+
+  warn "Rolling back ${service} to ${tag}…"
+  if env "${var}=${tag}" docker compose up -d --no-deps "$compose_svc"      && wait_for_health "$compose_svc" "$url" 10; then
+    warn "Rolled back ${service} to ${tag} and it is healthy."
+    warn "The deploy still FAILED — the new build needs fixing before retrying."
+    return 0
+  fi
+
+  warn "Rollback of ${service} to ${tag} did NOT come up healthy. Manual action required."
+  rollback_guidance "$service" "$image"
+}
+
 on_failure() {
   local rc=$?
+  # Stop trapping before running the handler, or a failing command inside it
+  # re-enters on_failure and the real exit code is lost.
+  trap - ERR
   echo
   warn "Deployment failed explicitly (target=${TARGET}, exit=${rc})."
-  case "$TARGET" in
-    backend) rollback_guidance backend "$PREVIOUS_BACKEND" ;;
-    frontend) rollback_guidance frontend "$PREVIOUS_FRONTEND" ;;
-    all)
+
+  # A failure at the disk check, the pull or the migration happens before
+  # `up -d`, so the previous container is still serving. Touching it then
+  # would turn a safe failure into an outage.
+  if [ "$BACKEND_REPLACED" != "1" ] && [ "$FRONTEND_REPLACED" != "1" ]; then
+    dim "No service was replaced; the running containers are untouched."
+    exit "$rc"
+  fi
+
+  if [ "$BACKEND_REPLACED" = "1" ]; then
+    if [ "$BACKEND_MIGRATED" = "1" ]; then
+      warn "NOT rolling the backend back automatically: this deploy applied database
+       migrations, so the schema has already moved forward. Restoring the old
+       image would run old code against a new schema — harmless for an additive
+       migration, wrong for a destructive one. That is a judgement call:"
       rollback_guidance backend "$PREVIOUS_BACKEND"
-      rollback_guidance frontend "$PREVIOUS_FRONTEND"
-      ;;
-  esac
+    else
+      rollback_service backend app "$PREVIOUS_BACKEND" http://localhost:3000/health/ready
+    fi
+  fi
+
+  if [ "$FRONTEND_REPLACED" = "1" ]; then
+    # Static assets behind nginx; no schema to disagree with.
+    rollback_service frontend frontend "$PREVIOUS_FRONTEND" http://127.0.0.1:8080/healthz
+  fi
+
   exit "$rc"
 }
 trap on_failure ERR
@@ -183,9 +243,23 @@ deploy_backend() {
   step "Pulling backend image"
   docker compose pull app
   step "Applying backend migrations before replacement"
-  docker compose run --rm --no-deps app bunx prisma migrate deploy
+  # Capture the outcome rather than streaming it: whether this deploy moved
+  # the schema is what decides if a failed health check may be rolled back
+  # automatically. Declared before the assignment on purpose — `local x="$(…)"`
+  # returns local's status, which would hide a failing migration from set -e.
+  local migrate_out
+  migrate_out="$(docker compose run --rm --no-deps app bunx prisma migrate deploy 2>&1)"
+  printf '%s
+' "$migrate_out" | sed 's/^/    /'
+  if printf '%s' "$migrate_out" | grep -q 'No pending migrations to apply'; then
+    BACKEND_MIGRATED=0
+  else
+    BACKEND_MIGRATED=1
+    warn "Schema changed in this deploy — automatic rollback is disabled for it."
+  fi
   step "Replacing backend service"
   docker compose up -d app
+  BACKEND_REPLACED=1
   wait_for_health app http://localhost:3000/health/ready
 }
 
@@ -195,6 +269,7 @@ deploy_frontend() {
   docker compose pull frontend
   step "Replacing frontend service"
   docker compose up -d frontend
+  FRONTEND_REPLACED=1
   wait_for_health frontend http://127.0.0.1:8080/healthz
 }
 
