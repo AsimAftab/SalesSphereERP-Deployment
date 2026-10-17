@@ -14,7 +14,7 @@ secrets in `/home/deploy/SalesSphereERP-Deployment/.env`, owned by `deploy`, mod
 | VM | `vm-salessphere-erp`, `Standard_B2als_v2` |
 | Static public IP | `52.184.100.204` |
 | PostgreSQL | `psql-salessphere-erp-ea.postgres.database.azure.com` |
-| Database | `salessphere` |
+| Application database | `postgres` (contains migrated ERP data) |
 | Production domains | `salessphere360.tech`, `api.salessphere360.tech` |
 
 Terraform adds only private Standard LRS Blob state storage and non-compute OIDC
@@ -73,7 +73,10 @@ terraform apply adoption.tfplan
 terraform plan
 ```
 
-The initial expected plan is **16 imports, 0 adds, 0 changes, 0 destroys**.
+The initial expected plan is **17 imports, 0 adds, 0 changes, 0 destroys**.
+Read-only verification located the migrated schema in `postgres`; the existing
+`salessphere` database is empty. Both are preserved on the same existing server;
+there is no extra PostgreSQL server or compute charge.
 Do not apply a plan that resets the database password, replaces the VM, removes
 tags, deletes rules, or recreates the public IP. The OS disk is owned by the VM
 resource, not separately managed by a conflicting Terraform resource.
@@ -136,7 +139,7 @@ using a nonstandard port. Never use the admin private key as a Terraform input.
 Azure exposes the PostgreSQL hostname and username, **not its existing password**.
 Provision the connection string securely; do not reset a migrated database
 password or read the legacy application's files to bypass missing credentials.
-Use the Azure hostname, database `salessphere`, and verified TLS. Do not copy the
+Use the Azure hostname, database `postgres`, and verified TLS. Do not copy the
 stale AWS RDS URL from a developer `.env`.
 
 Before starting the backend:
@@ -208,6 +211,10 @@ provide `TF_VAR_postgres_admin_password` through a protected environment variabl
 The password is ephemeral and the provider attribute is write-only, so the value
 is not stored in state/plans. Keep it available for the apply as well. Never
 enable this override during production adoption.
+
+Fresh infrastructure creates `salessphere`; adopted production uses the existing
+`postgres` database. Read the `application_database` Terraform output rather than
+assuming they have the same name.
 
 Bootstrap the host separately and restore secrets/data explicitly. Terraform
 creates infrastructure; it does not clone ERP data, Redis jobs, credentials,

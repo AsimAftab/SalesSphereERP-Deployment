@@ -157,6 +157,18 @@ resource "azurerm_postgresql_flexible_server_database" "erp" {
   }
 }
 
+resource "azurerm_postgresql_flexible_server_database" "migrated" {
+  count     = var.adopt_existing ? 1 : 0
+  name      = "postgres"
+  server_id = azurerm_postgresql_flexible_server.erp.id
+  charset   = "UTF8"
+  collation = "en_US.utf8"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 resource "azurerm_postgresql_flexible_server_firewall_rule" "existing" {
   for_each         = var.postgres_firewall_rules
   name             = each.key
@@ -171,4 +183,8 @@ output "server_host" {
 
 output "database_host" {
   value = azurerm_postgresql_flexible_server.erp.fqdn
+}
+
+output "application_database" {
+  value = var.adopt_existing ? azurerm_postgresql_flexible_server_database.migrated[0].name : azurerm_postgresql_flexible_server_database.erp.name
 }

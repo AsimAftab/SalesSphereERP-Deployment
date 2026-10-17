@@ -74,3 +74,9 @@ import {
   to       = azurerm_postgresql_flexible_server_firewall_rule.existing[each.key]
   id       = "${local.resource_group_id}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${var.postgres_name}/firewallRules/${each.key}"
 }
+
+import {
+  for_each = local.adoption
+  to       = azurerm_postgresql_flexible_server_database.migrated[0]
+  id       = "${local.resource_group_id}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${var.postgres_name}/databases/postgres"
+}
