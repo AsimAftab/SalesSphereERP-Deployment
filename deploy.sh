@@ -38,7 +38,7 @@ if [ "${DEPLOY_LOCK_HELD:-0}" != "1" ]; then
     || fail "Another deployment still holds $LOCK_FILE after ${DEPLOY_LOCK_TIMEOUT:-900}s."
 fi
 
-# Re-exec after reset so this process never continues reading a script while
+# Re-exec after refresh so this process never continues reading a script while
 # git is replacing that same file. Descriptor 9 survives exec and keeps the
 # deployment lock held across the refresh.
 if [ "${DEPLOY_REFRESHED:-0}" != "1" ]; then
@@ -46,7 +46,7 @@ if [ "${DEPLOY_REFRESHED:-0}" != "1" ]; then
   git rev-parse --is-inside-work-tree > /dev/null 2>&1 \
     || fail "Deployment directory is not a Git worktree."
   git fetch --depth 1 origin main
-  git reset --hard origin/main
+  git merge --ff-only origin/main
   [ -f .env ] || fail ".env disappeared during refresh; refusing to continue."
   [ -f Caddyfile.template ] || fail "Caddyfile.template is missing after refresh."
   [ -r data/public_suffix_list.dat ] \

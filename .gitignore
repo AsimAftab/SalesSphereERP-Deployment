@@ -14,6 +14,7 @@ Caddyfile.rollback
 .env.tmp.*
 .env.db.tmp.*
 .test-install.*
+.test-release.*
 .validation-caddy/
 
 # OS / editor noise
@@ -22,3 +23,18 @@ Thumbs.db
 .vscode
 .idea
 *.swp
+
+# Terraform state and saved plans can contain sensitive provider metadata.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
+*.tfbackend
+!*.tfbackend.example
+crash.log
+**/password_override.tf

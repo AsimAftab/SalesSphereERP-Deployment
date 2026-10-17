@@ -4,6 +4,13 @@ Provider-neutral production deployment for the SalesSphere ERP API and web
 frontend. Application images are pulled from GHCR; only Caddy publishes server
 ports.
 
+Azure uses one existing VM for all four containers and one existing PostgreSQL
+16 Flexible Server. Terraform adopts these resources rather than recreating
+them. See [the Azure/Terraform runbook](docs/azure-terraform.md) for infrastructure,
+cost/credit constraints, state bootstrap, manual Terraform approval, and cutover.
+Production readiness still requires database credentials, read-only data checks,
+and verified DNS/TLS; provisioning alone is not a completed deployment.
+
 ## Topology
 
 ```text
@@ -136,10 +143,18 @@ Backend and frontend workflows use the same names:
 | `SERVER_HOST` | Server IP or stable SSH hostname |
 | `SERVER_USER` | `deploy` |
 | `SERVER_SSH_KEY` | Private deployment key |
+| `SERVER_KNOWN_HOSTS` | Host keys verified through a trusted channel |
 | `SERVER_SSH_PORT` | SSH port, normally `22` |
 | `DEPLOYMENT_DIR` | `/home/deploy/SalesSphereERP-Deployment` |
 
 Create a `production` GitHub Environment for deployment protection rules.
+
+Application CI authenticates to GHCR through `release.sh` using its short-lived
+GitHub token over SSH stdin; authentication, pulls, and rollout share the same
+cross-repository lock. The normal `deploy.sh` command remains available for manual
+operations. `prepare_only=true` on either app workflow pulls the new image
+without starting services, migrations, or public smoke tests, even while the
+normal deploy gate is disabled.
 
 ## Operations
 
@@ -158,8 +173,9 @@ image, health, secret-name, and day-to-day command details.
 ## Validation
 
 ```bash
-bash -n install.sh deploy.sh update.sh deployment-lib.sh test-install.sh
+bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh
 bash test-install.sh
+bash test-release.sh
 source ./deployment-lib.sh && require_public_suffix_list
 cp .env.example .env
 docker compose config

@@ -1,0 +1,99 @@
+name: Terraform validation and plan
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'scripts/terraform-*.sh'
+      - '.github/workflows/terraform*.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'scripts/terraform-*.sh'
+      - '.github/workflows/terraform*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.12.1'
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive terraform
+      - name: Validate without cloud credentials
+        run: |
+          set -euo pipefail
+          for root in terraform/bootstrap terraform/environments/production; do
+            terraform -chdir="$root" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="$root" validate
+          done
+          bash -n scripts/terraform-init.sh
+
+  plan:
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: terraform-plan
+    concurrency:
+      group: terraform-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_PLAN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: 'true'
+      TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+      TF_VAR_admin_ssh_public_key: ${{ vars.AZURE_VM_SSH_PUBLIC_KEY }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: 'true'
+    defaults:
+      run:
+        working-directory: terraform/environments/production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.12.1'
+          terraform_wrapper: false
+      - name: Initialize private state with read-only infrastructure identity
+        run: bash ../../../scripts/terraform-init.sh
+      - name: Create reviewable plan
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -lock-timeout=5m -out=terraform.tfplan
+          terraform show -no-color terraform.tfplan > plan.txt
+          sha256sum terraform.tfplan > terraform.tfplan.sha256
+          jq -n --arg sha "$GITHUB_SHA" --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            '{sha: $sha, repository: $repository, run_id: $run_id}' > metadata.json
+          {
+            echo '### Terraform plan'
+            echo 'Review the saved plan artifact before dispatching Terraform apply.'
+            echo "Revision: \`$GITHUB_SHA\`"
+            echo "Plan run: \`$GITHUB_RUN_ID\`"
+            echo '```text'
+            tail -n 30 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: |
+            terraform/environments/production/terraform.tfplan
+            terraform/environments/production/terraform.tfplan.sha256
+            terraform/environments/production/plan.txt
+            terraform/environments/production/metadata.json
+          retention-days: 7
+          if-no-files-found: error

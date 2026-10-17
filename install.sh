@@ -567,9 +567,7 @@ phase_repo() {
   if [ -d "$REPO_DIR/.git" ]; then
     step "Repo already cloned — pulling latest"
     sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" fetch --depth 1 origin main
-    # Discards local edits by design: this repo is config-as-code. .env and
-    # the rendered Caddyfile are gitignored, so neither is touched.
-    sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" reset --hard origin/main
+    sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" merge --ff-only origin/main
   else
     step "Cloning $REPO_URL into $REPO_DIR"
     sudo -u "$DEPLOY_USER" git clone --depth 1 "$REPO_URL" "$REPO_DIR"
@@ -593,7 +591,7 @@ load_config() {
   for key in \
     IMAGE_TAG FRONTEND_IMAGE_TAG GHCR_IMAGE FRONTEND_GHCR_IMAGE \
     API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN \
-    NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL DATABASE_URL REDIS_URL \
+    NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL MARKETING_SITE_URL DATABASE_URL REDIS_URL \
     JWT_SECRET JWT_REFRESH_SECRET JWT_ACCESS_EXPIRES_IN JWT_REFRESH_EXPIRES_IN \
     CSRF_SECRET COOKIE_DOMAIN \
     CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET \
@@ -617,6 +615,7 @@ load_config() {
   if [ -z "${AUTH_SITE_DOMAIN:-}" ]; then
     AUTH_SITE_DOMAIN="$(derive_auth_site_domain "${API_DOMAIN:-}" "${FRONTEND_DOMAIN:-}" || true)"
   fi
+  : "${MARKETING_SITE_URL:=${MARKETING_URL:-}}"
 }
 
 # ============================================================
@@ -657,7 +656,8 @@ phase_config() {
        outside the explicitly configured auth site are rejected."
 
   : "${CORS_ORIGIN:=https://${FRONTEND_DOMAIN}}"
-  prompt MARKETING_URL "Marketing site URL" "https://${FRONTEND_DOMAIN#app.}"
+  prompt MARKETING_SITE_URL "Marketing site URL" "https://${FRONTEND_DOMAIN#app.}"
+  : "${MARKETING_URL:=${MARKETING_SITE_URL}}"
   prompt SUPERADMIN_EMAIL "Platform super-admin email" "admin@${API_DOMAIN#api.}"
   is_email "$SUPERADMIN_EMAIL" || fail "Invalid email: $SUPERADMIN_EMAIL"
 
@@ -715,7 +715,7 @@ phase_render() {
   # defining its variable.
   local v
   for v in IMAGE_TAG FRONTEND_IMAGE_TAG GHCR_IMAGE FRONTEND_GHCR_IMAGE \
-           NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL REDIS_URL \
+           NODE_ENV PORT APP_URL CORS_ORIGIN MARKETING_URL MARKETING_SITE_URL REDIS_URL \
            JWT_ACCESS_EXPIRES_IN JWT_REFRESH_EXPIRES_IN COOKIE_DOMAIN \
            CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET \
            CLOUDINARY_UPLOAD_FOLDER EMAIL_PROVIDER SMTP_HOST SMTP_PORT \
@@ -732,6 +732,8 @@ phase_render() {
   : "${PORT:=3000}"
   : "${APP_URL:=https://${API_DOMAIN}}"
   : "${CORS_ORIGIN:=https://${FRONTEND_DOMAIN}}"
+  : "${MARKETING_SITE_URL:=${MARKETING_URL:-https://${FRONTEND_DOMAIN#app.}}}"
+  : "${MARKETING_URL:=${MARKETING_SITE_URL}}"
   : "${REDIS_URL:=redis://redis:6379}"
   : "${JWT_ACCESS_EXPIRES_IN:=15m}"
   : "${JWT_REFRESH_EXPIRES_IN:=7d}"
@@ -774,6 +776,7 @@ PORT=${PORT}
 APP_URL=${APP_URL}
 CORS_ORIGIN=${CORS_ORIGIN}
 MARKETING_URL=${MARKETING_URL}
+MARKETING_SITE_URL=${MARKETING_SITE_URL}
 
 # --- Database ---
 DATABASE_URL=${DATABASE_URL}

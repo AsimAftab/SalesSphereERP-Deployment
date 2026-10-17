@@ -1,0 +1,90 @@
+name: Terraform apply reviewed plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_run_id:
+        description: Successful main-branch Terraform plan run ID
+        type: string
+        required: true
+      expected_sha:
+        description: Full reviewed commit SHA; must still be main HEAD
+        type: string
+        required: true
+      approve:
+        description: I reviewed this exact saved plan and approve applying it
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-production
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.approve }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: terraform-apply
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      ARM_CLIENT_ID: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: 'true'
+      TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+      TF_VAR_admin_ssh_public_key: ${{ vars.AZURE_VM_SSH_PUBLIC_KEY }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: 'true'
+    steps:
+      - name: Verify trusted plan provenance
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PLAN_RUN_ID")"
+          jq -e --arg sha "$EXPECTED_SHA" --arg repo "$GITHUB_REPOSITORY" '
+            .head_sha == $sha and .head_branch == "main" and
+            .repository.full_name == $repo and .head_repository.full_name == $repo and
+            .path == ".github/workflows/terraform.yml" and
+            .status == "completed" and .conclusion == "success" and
+            (.event == "push" or .event == "workflow_dispatch")
+          ' <<< "$run" > /dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$EXPECTED_SHA"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.12.1'
+          terraform_wrapper: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ inputs.plan_run_id }}
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.plan_run_id }}
+          path: terraform/environments/production
+      - name: Verify saved artifact and initialize state
+        working-directory: terraform/environments/production
+        run: |
+          set -euo pipefail
+          jq -e --arg sha "$EXPECTED_SHA" --arg repo "$GITHUB_REPOSITORY" --arg run "$PLAN_RUN_ID" \
+            '.sha == $sha and .repository == $repo and .run_id == $run' metadata.json > /dev/null
+          sha256sum --check terraform.tfplan.sha256
+          bash ../../../scripts/terraform-init.sh
+      - name: Apply exactly the approved plan
+        working-directory: terraform/environments/production
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$EXPECTED_SHA"
+          terraform apply -input=false -lock-timeout=5m terraform.tfplan

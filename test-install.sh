@@ -365,6 +365,7 @@ rendered_keys="$(cut -d= -f1 "${legacy_all}/before.env")"
 for key in $rendered_keys API_DOMAIN FRONTEND_DOMAIN AUTH_SITE_DOMAIN; do
   unset "$key"
 done
+unset MARKETING_SITE_URL
 REPO_DIR="$legacy_all"
 NON_INTERACTIVE=1
 DEPLOY_USER="$(id -un)"
@@ -387,8 +388,17 @@ check "migration adds FRONTEND_DOMAIN" "preserve.test" \
   "$(grep '^FRONTEND_DOMAIN=' "${legacy_all}/.env" | cut -d= -f2-)"
 check "migration adds AUTH_SITE_DOMAIN" "preserve.test" \
   "$(grep '^AUTH_SITE_DOMAIN=' "${legacy_all}/.env" | cut -d= -f2-)"
+check "legacy marketing URL reaches the backend's canonical setting" \
+  "$(grep '^MARKETING_URL=' "${legacy_all}/before.env" | cut -d= -f2-)" \
+  "$(grep '^MARKETING_SITE_URL=' "${legacy_all}/.env" | cut -d= -f2-)"
 check "migration does not print secret sentinels" "1" \
   "$(grep -qE 'sentinel-(db|jwt|refresh|csrf|cloud|smtp|resend|admin)-secret' "${legacy_all}/migration.log"; echo $?)"
+
+sed -i 's|^MARKETING_SITE_URL=.*|MARKETING_SITE_URL=https://canonical.preserve.test|' "${legacy_all}/.env"
+unset MARKETING_SITE_URL MARKETING_URL
+load_config
+check "canonical marketing URL takes precedence over legacy alias" \
+  "https://canonical.preserve.test" "$MARKETING_SITE_URL"
 
 REPO_DIR="$old_repo_dir"
 cd "$ROOT_DIR"

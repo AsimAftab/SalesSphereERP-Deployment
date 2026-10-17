@@ -1,0 +1,7 @@
+resource_group_name  = "rg-salessphere-erp-tfstate-eastasia"
+storage_account_name = "REPLACE_WITH_BOOTSTRAP_OUTPUT"
+container_name       = "tfstate"
+key                  = "production.tfstate"
+use_azuread_auth     = true
+subscription_id      = "dbc92609-fae7-45fd-8a98-b89d39828cd4"
+tenant_id            = "edf7fedf-588b-4c3a-a8c8-c9ed63015bcb"
