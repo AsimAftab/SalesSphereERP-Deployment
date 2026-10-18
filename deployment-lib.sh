@@ -169,6 +169,15 @@ install_caddy_config() {
   fi
 
   [ ! -f "$destination" ] || cp "$destination" "${destination}.rollback"
-  chmod 644 "$candidate"
-  mv -f "$candidate" "$destination"
+  # Overwrite in place, never `mv`. docker-compose.yml bind-mounts this single
+  # file into the Caddy container, and a single-file bind mount pins the inode
+  # it was started with: `mv` puts a new inode at the path while the container
+  # keeps reading the old one, so `caddy reload` re-applied the stale config
+  # and every Caddyfile change silently never reached production. Writing
+  # through the existing inode is what the mounted container actually sees.
+  # The candidate was fully rendered and validated above, so the non-atomic
+  # write only ever copies a known-good file.
+  cat "$candidate" > "$destination"
+  chmod 644 "$destination"
+  rm -f "$candidate"
 }
