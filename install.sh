@@ -566,7 +566,9 @@ phase_deploy_user() {
 phase_repo() {
   if [ -d "$REPO_DIR/.git" ]; then
     step "Repo already cloned — pulling latest"
-    sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" fetch --depth 1 origin main
+    # No --depth: a depth-1 fetch drops the new tip's parents and the
+    # fast-forward below then refuses "unrelated histories" (see deploy.sh).
+    sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" fetch origin main
     sudo -u "$DEPLOY_USER" git -C "$REPO_DIR" merge --ff-only origin/main
   else
     step "Cloning $REPO_URL into $REPO_DIR"
