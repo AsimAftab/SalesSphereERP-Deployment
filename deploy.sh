@@ -45,7 +45,12 @@ if [ "${DEPLOY_REFRESHED:-0}" != "1" ]; then
   step "Refreshing deployment configuration from origin/main"
   git rev-parse --is-inside-work-tree > /dev/null 2>&1 \
     || fail "Deployment directory is not a Git worktree."
-  git fetch --depth 1 origin main
+  # No --depth here. A depth-1 fetch hands back the new tip with its parents
+  # cut off, so on a worktree that is already behind, git sees two unrelated
+  # histories and the --ff-only merge below refuses. A plain fetch on a shallow
+  # clone downloads only the missing commits, back to the commit already held,
+  # so the fast-forward has an ancestor to stand on. The repo is small.
+  git fetch origin main
   git merge --ff-only origin/main
   [ -f .env ] || fail ".env disappeared during refresh; refusing to continue."
   [ -f Caddyfile.template ] || fail "Caddyfile.template is missing after refresh."
