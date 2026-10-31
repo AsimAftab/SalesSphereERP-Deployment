@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check Bash syntax
-        run: bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh
+        run: bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh scripts/sstrack.sh
 
       - name: Verify vendored Public Suffix List
         run: |
