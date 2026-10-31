@@ -47,7 +47,9 @@ sstrack — live tracking and raw GPS pings (read-only)
   --org NAME limit live/users to organizations whose name contains NAME
   --csv      CSV instead of a table (user, users, session):  ... --csv > file.csv
 
-Times are Nepal time. Pings are kept for 15 days.
+Each ping shows the address the phone saved; "~" marks the last known address
+carried forward (the phone only looks one up now and then). "map" is a Google
+Maps link to the exact point. Times are Nepal time. Pings are kept for 15 days.
 EOF
 }
 
@@ -98,6 +100,20 @@ TO_UTC="(((:'to')::date + 1)::timestamp AT TIME ZONE '$TZ_NPT' AT TIME ZONE 'UTC
 NOW_UTC="(now() AT TIME ZONE 'UTC')"
 ORG_MATCH="(:'org' = '' OR o.name ILIKE '%' || :'org' || '%')"
 
+# The phone reverse-geocodes only now and then (the first accurate fix, then
+# throttled), so most pings carry no address. Those show the session's last
+# address before them, marked "~". Nothing here geocodes — that would cost
+# money per lookup; it only reads what the phone saved.
+ADDRESS_SQL='coalesce(p."formattedAddress", '"'~ '"' || (
+  SELECT q."formattedAddress" FROM "TrackingPing" q
+  WHERE q."sessionId" = p."sessionId" AND q."formattedAddress" IS NOT NULL
+    AND q."recordedAt" <= p."recordedAt"
+  ORDER BY q."recordedAt" DESC LIMIT 1))'
+# A Google Maps link for a point: free, opens the exact spot.
+map_link() {
+  printf "'https://maps.google.com/?q=' || round((%s)::numeric, 6) || ',' || round((%s)::numeric, 6)" "$1" "$2"
+}
+
 # Sets DAY_FROM / DAY_TO (YYYY-MM-DD, Nepal) and DAY_LABEL.
 parse_day() {
   local arg="${1:-}" today n
@@ -140,12 +156,14 @@ ping_columns() {
 $(npt 'p."recordedAt"') AS time_npt,
 round(p.latitude::numeric, 6) AS lat,
 round(p.longitude::numeric, 6) AS lng,
+$ADDRESS_SQL AS address,
 round(p.accuracy::numeric) AS acc_m,
 round((p.speed * 3.6)::numeric, 1) AS kmh,
 p."batteryLevel" AS batt,
 p."nearestName" AS nearest_stop,
 round((p."nearestDistanceKm" * 1000)::numeric) AS stop_m,
-$(npt 'p."createdAt"' 'HH24:MI:SS') AS received
+$(npt 'p."createdAt"' 'HH24:MI:SS') AS received,
+$(map_link 'p.latitude' 'p.longitude') AS map
 SQL
 }
 
@@ -176,11 +194,13 @@ SELECT 'Live tracking  ' || $(npt "$NOW_UTC") || ' NPT   (refreshes every 10 s �
 SELECT u.name, o.name AS org, bp.name AS beat_plan, s.status,
        round(s."currentLatitude"::numeric, 6) AS lat,
        round(s."currentLongitude"::numeric, 6) AS lng,
+       s."currentAddress" AS address,
        round(s."currentAccuracy"::numeric) AS acc_m,
        s."currentBatteryLevel" AS batt,
        $(npt 's."lastPingAt"' 'HH24:MI:SS') AS last_ping,
        round(extract(epoch FROM ($NOW_UTC - s."lastPingAt")) / 60) AS mins_ago,
-       u.email
+       u.email,
+       $(map_link 's."currentLatitude"' 's."currentLongitude"') AS map
 FROM "TrackingSession" s
 JOIN "User" u ON u.id = s."userId"
 JOIN "Organization" o ON o.id = s."organizationId"
@@ -219,19 +239,28 @@ ORDER BY s."sessionStartedAt" DESC
 LIMIT 1;
 SQL
   echo "Following $name <$email> — new GPS pings appear below (Ctrl+C to stop)"
+  echo "ACCURACY = how close the GPS fix is likely to be (±m; smaller is better)."
   echo
+  # Same widths as the format() in line_sql below.
+  printf '%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
+    TIME LAT LNG ADDRESS ACCURACY SPEED BATTERY 'NEAREST STOP' MAP
+  printf '%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
+    -------- ---------- ---------- -------------------------------- -------- --------- ------- \
+    ---------------------- ---
 
   # Each row: received-at (exact, to resume from) <TAB> the line to print.
   local line_sql
   line_sql="$(cat <<SQL
 to_char(p."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.US') AS c,
-format('%s  %s, %s  acc %s m  %s km/h  batt %s  %s%s',
+format('%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s%s',
   $(npt 'p."recordedAt"' 'HH24:MI:SS'),
   round(p.latitude::numeric, 6), round(p.longitude::numeric, 6),
-  coalesce(round(p.accuracy::numeric)::text, '-'),
-  coalesce(round((p.speed * 3.6)::numeric, 1)::text, '-'),
+  coalesce($ADDRESS_SQL, '-'),
+  coalesce('±' || round(p.accuracy::numeric) || ' m', '-'),
+  coalesce(round((p.speed * 3.6)::numeric, 1) || ' km/h', '-'),
   coalesce(p."batteryLevel"::text || '%', '-'),
-  coalesce('near ' || p."nearestName" || ' (' || round((p."nearestDistanceKm" * 1000)::numeric) || ' m)', ''),
+  coalesce(p."nearestName" || ' (' || round((p."nearestDistanceKm" * 1000)::numeric) || ' m)', '-'),
+  $(map_link 'p.latitude' 'p.longitude'),
   CASE WHEN p."createdAt" - p."recordedAt" > interval '2 minutes'
        THEN '  [sent ' || round(extract(epoch FROM p."createdAt" - p."recordedAt") / 60) || ' min late]'
        ELSE '' END) AS line
@@ -418,11 +447,11 @@ SQL
       key = $1 FS $3
       if (key != last) {
         printf "\n== %s <%s> — %s ==\n", $2, $3, $1
-        printf "%-19s  %-10s %-10s %6s %6s %5s  %-8s  %s\n", "time_npt", "lat", "lng", "acc_m", "kmh", "batt", "received", "nearest stop"
+        printf "%-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s\n", "time_npt", "lat", "lng", "address", "acc_m", "kmh", "batt", "received", "nearest stop · map"
         last = key
       }
-      stop = ($10 == "" || $10 == "-") ? "" : $10 " (" $11 " m)"
-      printf "%-19s  %-10s %-10s %6s %6s %5s  %-8s  %s\n", $4, $5, $6, $7, $8, $9, $12, stop
+      stop = ($11 == "" || $11 == "-") ? "" : $11 " (" $12 " m) · "
+      printf "%-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s%s\n", $4, $5, $6, $7, $8, $9, $10, $13, stop, $14
     }'
 }
 
