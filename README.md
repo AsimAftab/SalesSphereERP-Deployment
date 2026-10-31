@@ -170,10 +170,39 @@ docker compose exec frontend wget -qO- http://127.0.0.1:8080/healthz
 The installer writes `/home/deploy/credentials-summary.txt` with server,
 image, health, secret-name, and day-to-day command details.
 
+### Viewing live tracking
+
+`scripts/sstrack.sh` shows field reps' live tracking and raw GPS pings from the
+server. It is **read-only**: it opens the database with
+`default_transaction_read_only=on`, so no command can change data. It runs
+`psql` in a throwaway `postgres:16-alpine` container (pulled once), reads
+`DATABASE_URL` from `.env` without printing it, and restarts nothing.
+
+Once per server, make it a command you can type from anywhere:
+
+```bash
+sudo ~/SalesSphereERP-Deployment/scripts/sstrack.sh install
+```
+
+| Command | Shows |
+|---|---|
+| `sstrack live [--org NAME]` | Everyone being tracked now: location, battery, last ping. Refreshes every 10 s; Ctrl+C stops. |
+| `sstrack follow EMAIL` | One user's GPS pings as they arrive, like `logs -f`. Ctrl+C stops. |
+| `sstrack user EMAIL [DAY]` | One user's sessions and every GPS ping, start to end. Prints and stops. |
+| `sstrack users [DAY] [--org NAME] [--pings]` | Every tracked user, one line each; `--pings` lists each user's pings under their name. |
+| `sstrack session SESSION_ID` | Every ping of one session. |
+| `sstrack find TEXT` | Find a user's email by name or email. |
+
+`DAY` is optional: nothing means today; `yesterday`, `3d` (the last 3 days, up to
+`15d`) or a date like `2026-10-30` also work. Times are Nepal time. Add `--csv`
+to `user`, `users` or `session` to save a file (`... --csv > ajay.csv`) and
+download it over SFTP. Pings are deleted after `TRACKING_RETENTION_DAYS`
+(15 days), so older days come back empty.
+
 ## Validation
 
 ```bash
-bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh
+bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh scripts/sstrack.sh
 bash test-install.sh
 bash test-release.sh
 source ./deployment-lib.sh && require_public_suffix_list
