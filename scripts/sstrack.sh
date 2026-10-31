@@ -152,6 +152,11 @@ SQL
   printf '%s\n' "$row"
 }
 
+# A ping's place in its session (1 = its first, by phone time).
+PING_NO_SQL='(SELECT count(*) FROM "TrackingPing" q
+  WHERE q."sessionId" = p."sessionId"
+    AND (q."recordedAt", q."createdAt") <= (p."recordedAt", p."createdAt"))'
+
 # Columns of one ping row, shared by the user/session/users reports.
 # "#" numbers the pings within their session (1 = its first, by phone time);
 # "mark" flags the session's first ping (START) and its newest (LATEST). Both
@@ -159,9 +164,7 @@ SQL
 # session that began yesterday is not marked START on today's first row.
 ping_columns() {
   cat <<SQL
-(SELECT count(*) FROM "TrackingPing" q
-  WHERE q."sessionId" = p."sessionId"
-    AND (q."recordedAt", q."createdAt") <= (p."recordedAt", p."createdAt")) AS "#",
+$PING_NO_SQL AS "#",
 CASE
   WHEN NOT EXISTS (SELECT 1 FROM "TrackingPing" q
                    WHERE q."sessionId" = p."sessionId"
@@ -216,6 +219,7 @@ SELECT u.name, o.name AS org, bp.name AS beat_plan, s.status,
        s."currentAddress" AS address,
        round(s."currentAccuracy"::numeric) AS acc_m,
        s."currentBatteryLevel" AS batt,
+       (SELECT count(*) FROM "TrackingPing" q WHERE q."sessionId" = s.id) AS pings,
        $(npt 's."lastPingAt"' 'HH24:MI:SS') AS last_ping,
        round(extract(epoch FROM ($NOW_UTC - s."lastPingAt")) / 60) AS mins_ago,
        u.email,
@@ -261,17 +265,19 @@ SQL
   echo "ACCURACY = how close the GPS fix is likely to be (±m; smaller is better)."
   echo
   # Same widths as the format() in line_sql below.
-  printf '%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
-    TIME LAT LNG ADDRESS ACCURACY SPEED BATTERY 'NEAREST STOP' MAP
-  printf '%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
-    -------- ---------- ---------- -------------------------------- -------- --------- ------- \
+  printf '%5s  %-7s  %-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
+    '#' MARK TIME LAT LNG ADDRESS ACCURACY SPEED BATTERY 'NEAREST STOP' MAP
+  printf '%5s  %-7s  %-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s\n' \
+    ----- ------- -------- ---------- ---------- -------------------------------- -------- --------- ------- \
     ---------------------- ---
 
   # Each row: received-at (exact, to resume from) <TAB> the line to print.
   local line_sql
   line_sql="$(cat <<SQL
 to_char(p."createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.US') AS c,
-format('%-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s%s',
+format('%5s  %-7s  %-8s  %-10s  %-10s  %-32s  %8s  %9s  %7s  %-22s  %s%s',
+  $PING_NO_SQL,
+  CASE WHEN $PING_NO_SQL = 1 THEN '▶ START' ELSE '' END,
   $(npt 'p."recordedAt"' 'HH24:MI:SS'),
   round(p.latitude::numeric, 6), round(p.longitude::numeric, 6),
   coalesce($ADDRESS_SQL, '-'),
