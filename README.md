@@ -199,6 +199,11 @@ to `user`, `users` or `session` to save a file (`... --csv > ajay.csv`) and
 download it over SFTP. Pings are deleted after `TRACKING_RETENTION_DAYS`
 (15 days), so older days come back empty.
 
+Each ping shows the address the phone saved. The app looks one up only now and
+then (it costs money and battery), so pings without their own show the last
+known address in that session, marked `~`. A `map` column gives a Google Maps
+link to the exact point. `sstrack` never looks up addresses itself.
+
 ## Validation
 
 ```bash
