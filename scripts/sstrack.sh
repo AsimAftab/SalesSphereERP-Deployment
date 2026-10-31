@@ -49,7 +49,9 @@ sstrack — live tracking and raw GPS pings (read-only)
 
 Each ping shows the address the phone saved; "~" marks the last known address
 carried forward (the phone only looks one up now and then). "map" is a Google
-Maps link to the exact point. Times are Nepal time. Pings are kept for 15 days.
+Maps link to the exact point. "#" numbers each ping within its session, and
+"mark" shows the session's first ping (▶ START) and its newest (● LATEST).
+Times are Nepal time. Pings are kept for 15 days.
 EOF
 }
 
@@ -151,8 +153,25 @@ SQL
 }
 
 # Columns of one ping row, shared by the user/session/users reports.
+# "#" numbers the pings within their session (1 = its first, by phone time);
+# "mark" flags the session's first ping (START) and its newest (LATEST). Both
+# look at the whole session, not just the rows the day filter kept, so a
+# session that began yesterday is not marked START on today's first row.
 ping_columns() {
   cat <<SQL
+(SELECT count(*) FROM "TrackingPing" q
+  WHERE q."sessionId" = p."sessionId"
+    AND (q."recordedAt", q."createdAt") <= (p."recordedAt", p."createdAt")) AS "#",
+CASE
+  WHEN NOT EXISTS (SELECT 1 FROM "TrackingPing" q
+                   WHERE q."sessionId" = p."sessionId"
+                     AND (q."recordedAt", q."createdAt") < (p."recordedAt", p."createdAt"))
+    THEN '▶ START'
+  WHEN NOT EXISTS (SELECT 1 FROM "TrackingPing" q
+                   WHERE q."sessionId" = p."sessionId"
+                     AND (q."recordedAt", q."createdAt") > (p."recordedAt", p."createdAt"))
+    THEN '● LATEST'
+END AS mark,
 $(npt 'p."recordedAt"') AS time_npt,
 round(p.latitude::numeric, 6) AS lat,
 round(p.longitude::numeric, 6) AS lng,
@@ -447,11 +466,11 @@ SQL
       key = $1 FS $3
       if (key != last) {
         printf "\n== %s <%s> — %s ==\n", $2, $3, $1
-        printf "%-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s\n", "time_npt", "lat", "lng", "address", "acc_m", "kmh", "batt", "received", "nearest stop · map"
+        printf "%5s  %-8s  %-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s\n", "#", "mark", "time_npt", "lat", "lng", "address", "acc_m", "kmh", "batt", "received", "nearest stop · map"
         last = key
       }
-      stop = ($11 == "" || $11 == "-") ? "" : $11 " (" $12 " m) · "
-      printf "%-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s%s\n", $4, $5, $6, $7, $8, $9, $10, $13, stop, $14
+      stop = ($13 == "" || $13 == "-") ? "" : $13 " (" $14 " m) · "
+      printf "%5s  %-8s  %-19s  %-10s %-10s  %-32s %6s %6s %5s  %-8s  %s%s\n", $4, $5, $6, $7, $8, $9, $10, $11, $12, $15, stop, $16
     }'
 }
 
