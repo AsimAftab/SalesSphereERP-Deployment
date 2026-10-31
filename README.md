@@ -186,8 +186,8 @@ sudo ~/SalesSphereERP-Deployment/scripts/sstrack.sh install
 
 | Command | Shows |
 |---|---|
-| `sstrack live [--org NAME]` | Everyone being tracked now: location, battery, last ping. Refreshes every 10 s; Ctrl+C stops. |
-| `sstrack follow EMAIL` | One user's GPS pings as they arrive, like `logs -f`. Ctrl+C stops. |
+| `sstrack live [--org NAME]` | Everyone being tracked now: last ping, minutes since, pings, battery, accuracy, current address. Refreshes every 10 s; Ctrl+C stops. |
+| `sstrack follow EMAIL [--keep]` | One user's GPS pings as they arrive, like `logs -f`. Notes when tracking pauses or resumes, and stops when the session ends (`--keep` waits for the next one). Ctrl+C stops sooner. |
 | `sstrack user EMAIL [DAY]` | One user's sessions and every GPS ping, start to end. Prints and stops. |
 | `sstrack users [DAY] [--org NAME] [--pings]` | Every tracked user, one line each; `--pings` lists each user's pings under their name. |
 | `sstrack session SESSION_ID` | Every ping of one session. |
@@ -199,15 +199,44 @@ to `user`, `users` or `session` to save a file (`... --csv > ajay.csv`) and
 download it over SFTP. Pings are deleted after `TRACKING_RETENTION_DAYS`
 (15 days), so older days come back empty.
 
+On screen each ping shows only what says whether pings are arriving and where
+the user is: `#` (its place in the session), a mark (`▶ START` / `● LATEST`),
+time, address, accuracy, battery, and `sent N min late` for a ping the phone
+held with no signal. `--csv` keeps every column (lat/lng, speed, nearest stop,
+a Google Maps link, ...).
+
 Each ping shows the address the phone saved. The app looks one up only now and
 then (it costs money and battery), so pings without their own show the last
-known address in that session, marked `~`. A `map` column gives a Google Maps
-link to the exact point. `sstrack` never looks up addresses itself.
+known address in that session, marked `~`. `sstrack` never looks up addresses
+itself. A session's km is its cleaned distance, filled in when the session
+ends; an open session shows `(open)` (the web shows its distance so far).
+
+### Reading the server logs
+
+`scripts/sslogs.sh` turns the containers' JSON logs into one readable line
+each, in Nepal time, without request ids, IP addresses or process details, and
+with tokens in URLs masked. It only reads `docker logs`; it changes and
+restarts nothing.
+
+```bash
+sudo ~/SalesSphereERP-Deployment/scripts/sslogs.sh install
+```
+
+| Command | Shows |
+|---|---|
+| `sslogs status` | Containers, CPU/memory, server load, disk, and how fast the API and website answer. |
+| `sslogs errors [--since 1h]` | Warnings and errors from the API, with the error's message and where it came from. |
+| `sslogs slow [--since 2h] [--top 25]` | The slowest API requests, slowest first. |
+| `sslogs api [--since 30m] [-f]` | API requests and events, one line each; `-f` keeps streaming. |
+| `sslogs user EMAIL [--since 24h]` | Log lines about one user (tracking, sockets, jobs). Plain API requests carry no user. |
+| `sslogs web [--since 1h] [--errors]` | Website + API access log from Caddy; `--errors` keeps only 4xx/5xx. |
+
+`--since` takes `30m`, `2h` or `1d`, as far back as the container still holds.
 
 ## Validation
 
 ```bash
-bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh scripts/sstrack.sh
+bash -n install.sh deploy.sh release.sh update.sh deployment-lib.sh test-install.sh test-release.sh bootstrap-host.sh scripts/terraform-init.sh scripts/sstrack.sh scripts/sslogs.sh
 bash test-install.sh
 bash test-release.sh
 source ./deployment-lib.sh && require_public_suffix_list
