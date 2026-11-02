@@ -15,7 +15,7 @@ secrets in `/home/deploy/SalesSphereERP-Deployment/.env`, owned by `deploy`, mod
 | Static public IP | `52.184.100.204` |
 | PostgreSQL | `psql-salessphere-erp-ea.postgres.database.azure.com` |
 | Application database | `postgres` (contains migrated ERP data) |
-| Production domains | `salessphere360.tech`, `api.salessphere360.tech` |
+| Production domains | `salessphere360.com`, `api.salessphere360.com` |
 
 Terraform adds only private Standard LRS Blob state storage and non-compute OIDC
 identities/access grants. State storage has a small usage-based charge.
@@ -179,8 +179,8 @@ host-header routing without publishing internal ports.
 Only then change the A records:
 
 ```text
-salessphere360.tech      -> 52.184.100.204
-api.salessphere360.tech  -> 52.184.100.204
+salessphere360.com      -> 52.184.100.204
+api.salessphere360.com  -> 52.184.100.204
 ```
 
 Preserve unrelated DNS records, check CAA/CNAME/AAAA conflicts, and retain prior

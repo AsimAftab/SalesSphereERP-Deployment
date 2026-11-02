@@ -224,7 +224,7 @@ check "rejects suffix lookalike" "1" \
 check "rejects public-suffix cross-sites" "1" \
   "$(validate_auth_site_domains 'api.foo.blogspot.com' 'app.bar.blogspot.com' 'foo.blogspot.com'; echo $?)"
 check "accepts production registrable domain" "0" \
-  "$(validate_auth_site_domains 'api.salessphere360.tech' 'salessphere360.tech' 'salessphere360.tech'; echo $?)"
+  "$(validate_auth_site_domains 'api.salessphere360.com' 'salessphere360.com' 'salessphere360.com'; echo $?)"
 check "rejects ICANN public suffix root" "1" \
   "$(validate_auth_site_domains 'api.co.uk' 'app.co.uk' 'co.uk'; echo $?)"
 check "rejects PRIVATE public suffix root" "1" \
